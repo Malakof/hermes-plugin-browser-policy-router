@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pyright/
+.pytest_cache/
+
+# Machine-local Hermes policy. Commit config.yaml.example instead.
+config.yaml
+
+# Persisted runtime state (sessions, global default). Regenerated at runtime.
+.state.json

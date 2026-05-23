@@ -1,0 +1,81 @@
+# browser-policy-router — example config.
+#
+# Copy this file to ``config.yaml`` and edit for your environment.
+# config.yaml is gitignored and machine-local; never commit it.
+
+# Routing mode for sessions that have no session-specific pin and no
+# global pin: "auto" means classify the URL.
+default_mode: auto
+
+# Engine used when an URL doesn't match any class and routing falls
+# back to the interactive default. Set to "cloud" (Browserbase) for
+# normal use; "profile:main" is also valid.
+default_interactive_engine: cloud
+
+# Free-form label of the cloud provider you expect Hermes to use.
+# Shown in /browser-status output; not consulted at runtime.
+cloud_provider_expected: browserbase
+
+local_profile:
+  name: main
+  cdp_url: http://127.0.0.1:9222
+  # Replace 501 with your macOS UID (run: ``id -u``). For Linux/systemd
+  # users this field is not used — set recovery_enabled: false.
+  launchctl_label: gui/501/com.hermes.chrome-profile-main
+  recovery_enabled: true
+  recovery_timeout_s: 8
+  recovery_poll_interval_s: 0.5
+
+# Routing classes. Each entry is matched against the URL host using
+# exact and glob (``*.example.com``) patterns. First match wins, in
+# the order: internal_debug, hard_login, subscription_login, public_read.
+classes:
+  internal_debug:
+    engine: profile:main
+    domains:
+      - localhost
+      - "*.localhost"
+      - "127.0.0.1"
+      - "*.local"
+
+  # Sites where the local Chrome profile holds an authenticated
+  # session that the cloud browser cannot reproduce.
+  hard_login:
+    engine: profile:main
+    domains:
+      - x.com
+      - "*.x.com"
+      - twitter.com
+      - "*.twitter.com"
+      - linkedin.com
+      - "*.linkedin.com"
+      - accounts.google.com
+      - mail.google.com
+
+  # Sites where you accept the cloud browser handling logins
+  # (e.g. subscriptions you've configured Browserbase for).
+  subscription_login:
+    engine: cloud
+    domains:
+      - lemonde.fr
+      - "*.lemonde.fr"
+      - ft.com
+      - "*.ft.com"
+
+  # Public read-only sites. The plugin tries the fast_read_chain
+  # first and falls back to cloud only if extraction fails.
+  public_read:
+    strategy: fast_read
+    domains:
+      - wikipedia.org
+      - "*.wikipedia.org"
+      - news.ycombinator.com
+
+# Ordered list of tools dispatched on ``fast_read`` routes. Each entry
+# must be a registered Hermes tool, or the special sentinel
+# ``cloud_browser`` which terminates the chain and hands off to a real
+# browser run.
+fast_read_chain:
+  - web_extract
+  - web_search
+  - cloud_browser

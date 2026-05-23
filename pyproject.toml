@@ -1,0 +1,57 @@
+[project]
+name = "hermes-plugin-browser-policy-router"
+version = "1.0.0-beta.1"
+description = "Hermes plugin: route browser work between local Chrome profile, configured cloud browser, and fast read tools."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "pyright"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error"]
+# ``importlib`` mode keeps the plugin's ``__init__.py`` from being treated
+# as a package root by pytest's collector — its relative imports only work
+# when loaded through ``importlib.util.spec_from_file_location`` as the
+# Hermes loader does at runtime, which conftest mirrors.
+addopts = "--import-mode=importlib"
+# Treat ``tests`` as a namespace package: pytest 8+ otherwise walks up
+# looking for ``__init__.py`` and trips over the plugin's own one (which
+# can only be loaded as a package, not as a free-standing module).
+consider_namespace_packages = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B", "SIM", "RET", "PL"]
+# Keep timezone.utc rather than datetime.UTC because the gateway host may run
+# tooling against the macOS system Python 3.9 even though Hermes itself uses
+# Python 3.11.
+ignore = ["UP017"]
+
+[tool.ruff.lint.per-file-ignores]
+# Deferred import of hermes_state inside ``_resolve_session_id`` is
+# intentional: importing it at plugin load would violate the Hermes
+# plugin convention of "no import-time side effects". (Other lazy
+# imports were replaced by ``importlib.import_module``.)
+"commands.py" = ["PLC0415", "PLR2004"]
+# Tests use small integer literals (lengths, indices) and patch helpers
+# that import sys inside the function body — both are fine in tests.
+"tests/*" = ["PLC0415", "PLR2004"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+# tools.* lives in the Hermes installation (sys.path-added at runtime); it's
+# not importable from a standalone checkout of this plugin, so suppress the
+# unresolved-import diagnostic.
+reportMissingImports = "none"
+# yaml may resolve as namespace package depending on env.
+reportMissingModuleSource = "none"
+# Lazy submodule access inside ``from tools import (browser_tool,)`` fools
+# pyright (which expects the import to be a top-level name); the runtime
+# behaviour is correct.
+reportAttributeAccessIssue = "warning"
