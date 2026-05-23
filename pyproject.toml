@@ -1,6 +1,6 @@
 [project]
 name = "hermes-plugin-browser-policy-router"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 description = "Hermes plugin: route browser work between local Chrome profile, configured cloud browser, and fast read tools."
 readme = "README.md"
 requires-python = ">=3.11"
