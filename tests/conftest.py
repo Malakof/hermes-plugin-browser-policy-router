@@ -67,6 +67,25 @@ def isolated_state(plugin, tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def local_chrome_available(plugin, monkeypatch):
+    """Make ``ensure_local_profile`` succeed without a real Chrome.
+
+    Tests that call ``/browser-local`` (or ``browser_policy_set(engine="profile:main")``)
+    need ``ensure_local_profile`` to return ok so the global default
+    actually gets pinned. CI runners don't have Chrome on 127.0.0.1:9222
+    nor ``/bin/launchctl``, so we stub the probe + recovery path.
+    """
+    monkeypatch.setattr(plugin.routing, "cdp_ready", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        plugin.routing,
+        "ensure_local_profile",
+        lambda cfg: plugin.routing.RecoveryResult(ok=True, recovered=False),
+    )
+    # Avoid touching the real browser_tool cleanup on switch.
+    monkeypatch.setattr(plugin.routing, "cleanup_browsers", lambda: None)
+
+
+@pytest.fixture
 def base_config():
     """Realistic config dict — mirrors config.yaml.example domain classes."""
     return {

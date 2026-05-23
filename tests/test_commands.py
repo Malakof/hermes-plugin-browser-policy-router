@@ -28,7 +28,9 @@ def _install_hermes_state(monkeypatch):
 
 
 class TestSlashAutoOverride:
-    def test_browser_auto_session_sets_ignore_global_true(self, plugin, monkeypatch, base_config):
+    def test_browser_auto_session_sets_ignore_global_true(
+        self, plugin, monkeypatch, base_config, local_chrome_available
+    ):
         _install_hermes_state(monkeypatch)
         # Pre-condition: global pin = local
         plugin.commands.cmd_browser_local("")
@@ -41,7 +43,7 @@ class TestSlashAutoOverride:
         assert sess["ignore_global"] is True
 
     def test_browser_auto_session_makes_lemonde_route_cloud(
-        self, plugin, monkeypatch, base_config, tmp_path
+        self, plugin, monkeypatch, base_config, tmp_path, local_chrome_available
     ):
         _install_hermes_state(monkeypatch)
         plugin.commands.cmd_browser_local("")
@@ -55,7 +57,9 @@ class TestSlashAutoOverride:
         assert route.engine == "cloud"
         assert route.reason == "subscription cloud route"
 
-    def test_other_sessions_still_inherit_global_pin(self, plugin, monkeypatch, base_config):
+    def test_other_sessions_still_inherit_global_pin(
+        self, plugin, monkeypatch, base_config, local_chrome_available
+    ):
         _install_hermes_state(monkeypatch)
         plugin.commands.cmd_browser_local("")
         plugin.commands.cmd_browser_auto("my-research")
@@ -67,7 +71,7 @@ class TestSlashAutoOverride:
         assert route.engine == "profile:main"
         assert route.reason == "global default pinned"
 
-    def test_pinning_clears_ignore_global(self, plugin, monkeypatch):
+    def test_pinning_clears_ignore_global(self, plugin, monkeypatch, local_chrome_available):
         _install_hermes_state(monkeypatch)
         plugin.commands.cmd_browser_auto("my-research")
         assert plugin.state.SESSION_STATE["s_abc123"]["ignore_global"] is True
