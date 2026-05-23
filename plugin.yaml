@@ -3,7 +3,7 @@ name: browser-policy-router
 version: 1.0.0-beta.1
 kind: standalone
 description: Route Hermes browser work between local Chrome profile, configured cloud browser, and fast read tools.
-author: Richard / local
+author: Malakof
 provides_tools:
   - browser_policy_status
   - browser_policy_set
