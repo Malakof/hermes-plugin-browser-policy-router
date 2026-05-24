@@ -5,7 +5,7 @@ tools.
 tools (snapshot/click/type/...) reuse the session's last route. Every wrapper
 holds ``state.ROUTER_LOCK`` from route resolution through the delegated tool
 call so two concurrent browser turns cannot race on the process-global
-``BROWSER_CDP_URL``.
+``BROWSER_CDP_URL`` / ``CAMOFOX_URL``.
 """
 
 from __future__ import annotations
@@ -232,8 +232,9 @@ def _fast_read_response(url: str, route: routing.Route, fast: dict[str, Any]) ->
             "requires_browser_for_interaction": True,
             "note": (
                 "Result obtained via fast read instead of a real browser. "
-                "Call browser_policy_set(engine='cloud') or 'profile:main' first "
-                "if you need to interact with the page (click, type, snapshot)."
+                "Call browser_policy_set(engine='cloud') or 'profile:main' "
+                "or 'camofox:main' first if you need to interact with the "
+                "page (click, type, snapshot)."
             ),
         },
         ensure_ascii=False,
@@ -308,6 +309,14 @@ def _browser_navigate_impl(args: dict[str, Any], **kwargs) -> str:
     with state.ROUTER_LOCK:
         session = state.get_session(session_key)
         route = routing.ensure_route_available(route, config)
+        # Apply localhost->host.docker.internal rewrite if we landed on
+        # Camofox: the container cannot dial the Mac's loopback directly.
+        navigate_url = url
+        if route.engine == "camofox:main":
+            navigate_url, target = routing.maybe_rewrite_localhost_for_camofox(url, config)
+            if target and navigate_url != url:
+                route.browser_url = navigate_url
+                route.reason = (route.reason or "") + f"; rewrote localhost to {target}"
         routing.maybe_cleanup_on_switch(session, route)
         routing.apply_engine(route)
         routing.update_session_after_route(session, route, url)
@@ -329,7 +338,7 @@ def _browser_navigate_impl(args: dict[str, Any], **kwargs) -> str:
                 ensure_ascii=False,
             )
 
-        result = _bt().browser_navigate(url=url, task_id=kwargs.get("task_id"))
+        result = _bt().browser_navigate(url=navigate_url, task_id=kwargs.get("task_id"))
 
     return _annotate(result, route, url)
 
@@ -346,17 +355,20 @@ def _reuse_session_route(session: dict[str, Any]) -> routing.Route | None:
     navigate, or the last navigate was a ``fast_read`` chain result with
     no DOM loaded). The caller MUST NOT delegate to the underlying
     browser tool in that case — the process-global ``BROWSER_CDP_URL``
-    might still point at another session's profile, which would attach
-    the follow-up to the wrong browser.
+    or ``CAMOFOX_URL`` might still point at another session's profile,
+    which would attach the follow-up to the wrong browser.
     """
     last_engine = session.get("last_engine")
     if not last_engine or last_engine == "fast_read":
         return None
-    return routing.Route(
+    route = routing.Route(
         engine=last_engine,
         cdp_url=session.get("cdp_url"),
         reason="reuse session route",
     )
+    if last_engine == "camofox:main":
+        route.camofox_url = session.get("camofox_url")
+    return route
 
 
 def _no_reusable_route_error(tool_name: str, session: dict[str, Any]) -> str:
@@ -365,8 +377,8 @@ def _no_reusable_route_error(tool_name: str, session: dict[str, Any]) -> str:
         reason = (
             "the session's last browser action was a fast_read "
             "(no DOM was loaded); call browser_policy_set(engine='cloud' "
-            "or 'profile:main') and browser_navigate again before "
-            "interactive tools"
+            "or 'profile:main' or 'camofox:main') and browser_navigate "
+            "again before interactive tools"
         )
     else:
         reason = "no prior browser_navigate on this session; call browser_navigate first"
@@ -389,15 +401,21 @@ def _follow_up(
     delegate: Callable[[], str],
 ) -> str:
     session_key = get_session_key(kwargs)
+    config = routing.load_config()
     with state.ROUTER_LOCK:
         session = state.get_session(session_key)
         route = _reuse_session_route(session)
         if route is None:
-            # Refuse to delegate: BROWSER_CDP_URL may still point at
-            # another session's Chrome profile from an earlier turn, and
-            # silently snapshotting/clicking on the wrong browser is the
-            # exact bug this wrapper is meant to prevent.
+            # Refuse to delegate: BROWSER_CDP_URL / CAMOFOX_URL may still
+            # point at another session's browser from an earlier turn,
+            # and silently snapshotting/clicking on the wrong browser is
+            # the exact bug this wrapper is meant to prevent.
             return _no_reusable_route_error(tool_name, session)
+        # Re-hydrate Camofox env defaults from config for camofox:main
+        # routes; the session may only have stored ``camofox_url`` not
+        # the user_id/session_key fields.
+        if route.engine == "camofox:main":
+            routing._hydrate_camofox_route(route, config)
         routing.apply_engine(route)
         try:
             return delegate()
@@ -540,7 +558,7 @@ def get_check_browser_requirements():
 # ---------------------------------------------------------------------------
 
 
-def _annotate(raw_result: str, route: routing.Route, url: str) -> str:
+def _annotate(raw_result: str, route: routing.Route, requested_url: str) -> str:
     if not isinstance(raw_result, str) or not raw_result.strip().startswith("{"):
         return raw_result
     try:
@@ -553,6 +571,7 @@ def _annotate(raw_result: str, route: routing.Route, url: str) -> str:
         "engine": route.engine,
         "reason": route.reason,
         "fallback_from": route.fallback_from,
-        "url": url,
+        "url": requested_url,
+        "browser_url": route.browser_url or requested_url,
     }
     return json.dumps(payload, ensure_ascii=False)

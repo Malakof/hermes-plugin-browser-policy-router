@@ -7,9 +7,9 @@ BROWSER_POLICY_STATUS = {
     "description": (
         "Show the current browser routing policy for this session: mode "
         "(auto/pinned), pinned engine if any, last engine used, last reason, "
-        "local Chrome CDP readiness, and configured cloud provider. "
-        "Call this before/after browser work to confirm where the next "
-        "browser_navigate will run."
+        "local Chrome CDP readiness, Camofox /health readiness, and configured "
+        "cloud provider. Call this before/after browser work to confirm where "
+        "the next browser_navigate will run."
     ),
     "parameters": {
         "type": "object",
@@ -24,19 +24,22 @@ BROWSER_POLICY_SET = {
     "description": (
         "Pin or unpin the browser engine for this session. "
         "engine='profile:main' uses the local logged-in Chrome profile via "
-        "BROWSER_CDP_URL on 127.0.0.1:9222. engine='cloud' unsets "
-        "BROWSER_CDP_URL so the configured cloud browser (expected: "
-        "Browserbase) is used. engine='auto' makes this session genuinely "
-        "URL-driven and stops it from inheriting any global default pin set "
-        "by a slash command — use this when you explicitly want the router "
-        "to classify each URL on its own."
+        "BROWSER_CDP_URL on 127.0.0.1:9222 (GUI-bound). "
+        "engine='camofox:main' uses the durable local Camofox/Camoufox browser "
+        "running in Docker via noVNC; persists across reboots and GUI logout. "
+        "engine='cloud' unsets BROWSER_CDP_URL and CAMOFOX_URL so the configured "
+        "cloud browser (expected: Browserbase) is used. "
+        "engine='auto' makes this session genuinely URL-driven and stops it "
+        "from inheriting any global default pin set by a slash command — use "
+        "this when you explicitly want the router to classify each URL on its "
+        "own."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "engine": {
                 "type": "string",
-                "enum": ["profile:main", "cloud", "auto"],
+                "enum": ["profile:main", "camofox:main", "cloud", "auto"],
                 "description": (
                     "Engine to pin, or 'auto' to enable URL-driven routing "
                     "for this session (also overrides any global default "
@@ -56,11 +59,12 @@ BROWSER_POLICY_ROUTE = {
         "policy and pinned mode, then return the chosen engine. "
         "Call this BEFORE browser_navigate when you want explicit routing "
         "control (e.g. unsupervised auto runs). The engine chosen is one of "
-        "'profile:main' (local Chrome), 'cloud' (Browserbase), or "
-        "'fast_read' (web_extract/web_search chain). hint='auto' (default) "
-        "lets the policy decide; hint='local'|'cloud'|'fast_read' forces "
-        "the choice and latches it as a one-shot for the next "
-        "browser_navigate on this session."
+        "'profile:main' (local Chrome), 'camofox:main' (durable local Camofox "
+        "in Docker), 'cloud' (Browserbase), or 'fast_read' (web_extract/"
+        "web_search chain). hint='auto' (default) lets the policy decide; "
+        "hint='chrome'|'camofox'|'cloud'|'fast_read' forces the choice and "
+        "latches it as a one-shot for the next browser_navigate on this "
+        "session."
     ),
     "parameters": {
         "type": "object",
@@ -71,7 +75,7 @@ BROWSER_POLICY_ROUTE = {
             },
             "hint": {
                 "type": "string",
-                "enum": ["auto", "local", "cloud", "fast_read"],
+                "enum": ["auto", "chrome", "camofox", "cloud", "fast_read"],
                 "description": "Optional override; defaults to 'auto'.",
             },
         },

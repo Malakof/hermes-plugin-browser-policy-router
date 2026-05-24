@@ -1,4 +1,4 @@
-"""Routing policy, URL classification, env mutation, local Chrome recovery."""
+"""Routing policy, URL classification, env mutation, local Chrome + Camofox recovery."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 try:
     import yaml  # type: ignore[reportMissingModuleSource]
@@ -85,9 +85,18 @@ def load_config(reload: bool = False) -> dict[str, Any]:
 
 @dataclass
 class Route:
-    engine: str  # "profile:main" | "cloud" | "fast_read"
+    engine: str  # "profile:main" | "camofox:main" | "cloud" | "fast_read"
     reason: str = ""
     cdp_url: str | None = None
+    # Camofox-specific env applied by ``apply_engine``.
+    camofox_url: str | None = None
+    camofox_user_id: str | None = None
+    camofox_session_key: str | None = None
+    camofox_adopt_existing_tab: bool | None = None
+    # If the wrapper rewrote ``url`` (e.g. localhost -> host.docker.internal)
+    # the rewritten target lands here so the wrapper can pass it to the
+    # underlying browser tool and annotate the response.
+    browser_url: str | None = None
     fallback_from: str | None = None
     error: str | None = None
     attempts: list[dict[str, Any]] = field(default_factory=list)
@@ -97,6 +106,11 @@ class Route:
             "engine": self.engine,
             "reason": self.reason,
             "cdp_url": self.cdp_url,
+            "camofox_url": self.camofox_url,
+            "camofox_user_id": self.camofox_user_id,
+            "camofox_session_key": self.camofox_session_key,
+            "camofox_adopt_existing_tab": self.camofox_adopt_existing_tab,
+            "browser_url": self.browser_url,
             "fallback_from": self.fallback_from,
             "error": self.error,
             "attempts": self.attempts,
@@ -155,6 +169,39 @@ def matches_class(host: str, class_name: str, config: dict[str, Any]) -> bool:
     cls = classes.get(class_name, {}) or {}
     patterns = cls.get("domains", []) or []
     return any(host_matches(host, pattern) for pattern in patterns)
+
+
+# Class iteration order for ``decide_route``. The order is the priority:
+# the first class whose pattern list matches the URL wins.
+#
+# ``hard_login`` is kept for backward compatibility with v1.0 configs;
+# new deployments should use ``durable_local_login`` (camofox:main) for
+# x.com/linkedin and ``human_profile_login`` (profile:main) for Google.
+_CLASS_PRIORITY: tuple[str, ...] = (
+    "internal_debug",
+    "durable_local_login",
+    "hard_login",
+    "human_profile_login",
+    "subscription_login",
+    "public_read",
+)
+
+
+def _class_engine(cls_cfg: dict[str, Any]) -> str | None:
+    """Return the engine for a class config, honouring ``strategy: fast_read``.
+
+    ``strategy`` is the legacy field name for ``public_read``; we map it
+    to engine ``fast_read`` so callers don't have to know about it.
+    """
+    if not isinstance(cls_cfg, dict):
+        return None
+    engine = cls_cfg.get("engine")
+    if isinstance(engine, str) and engine.strip():
+        return engine.strip()
+    strategy = cls_cfg.get("strategy")
+    if isinstance(strategy, str) and strategy.strip().lower() == "fast_read":
+        return "fast_read"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +263,32 @@ def launchctl_state(label: str) -> str:
     if "state = " in out:
         return "stopped"
     return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Camofox probing
+# ---------------------------------------------------------------------------
+
+
+_HTTP_OK_MIN = 200
+_HTTP_OK_MAX = 300
+
+
+def camofox_ready(health_url: str, timeout: float = 1.5) -> bool:
+    """True if the Camofox /health endpoint returns 200."""
+    if not health_url:
+        return False
+    try:
+        req = urllib.request.Request(health_url, headers={"Connection": "close"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return _HTTP_OK_MIN <= response.status < _HTTP_OK_MAX
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        OSError,
+    ):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -287,11 +360,157 @@ def ensure_local_profile(config: dict[str, Any]) -> RecoveryResult:  # noqa: PLR
 
 
 # ---------------------------------------------------------------------------
+# Camofox recovery
+# ---------------------------------------------------------------------------
+
+
+def _camofox_cfg(config: dict[str, Any]) -> dict[str, Any]:
+    cfg = (config or {}).get("camofox", {}) or {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _camofox_health_url(camo: dict[str, Any]) -> str:
+    health = camo.get("health_url")
+    if isinstance(health, str) and health.strip():
+        return health.strip()
+    base = camo.get("url")
+    if isinstance(base, str) and base.strip():
+        return base.strip().rstrip("/") + "/health"
+    return ""
+
+
+def ensure_camofox(config: dict[str, Any]) -> RecoveryResult:  # noqa: PLR0911,PLR0912
+    # Recovery mirrors ``ensure_local_profile``: probe, then escalate via
+    # the Colima daemon kickstart + ``docker start`` of the container.
+    # Each branch keeps a distinct ``reason`` so /browser-status can show
+    # why the engine is unavailable.
+    camo = _camofox_cfg(config)
+    health_url = _camofox_health_url(camo)
+    if not health_url:
+        return RecoveryResult(ok=False, reason="camofox not configured (missing url/health_url)")
+
+    if camofox_ready(health_url):
+        return RecoveryResult(ok=True, recovered=False)
+
+    if not camo.get("recovery_enabled", True):
+        return RecoveryResult(ok=False, reason="camofox down; recovery disabled")
+
+    timeout_s = float(camo.get("recovery_timeout_s", 20))
+    poll_s = float(camo.get("recovery_poll_interval_s", 1.0))
+
+    attempts: list[str] = []
+
+    # 1. Make sure the Colima daemon is up — if it isn't, ``docker start``
+    #    below cannot reach the Docker socket.
+    label = camo.get("colima_launchctl_label", "")
+    if label:
+        try:
+            proc = subprocess.run(
+                ["/bin/launchctl", "kickstart", "-k", label],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            attempts.append(f"launchctl kickstart {label} raised {exc}")
+        else:
+            if proc.returncode != 0:
+                attempts.append(
+                    f"launchctl kickstart {label} rc={proc.returncode} "
+                    f"stderr={_truncate(proc.stderr)}"
+                )
+
+    # 2. ``docker start`` the container. ``--restart unless-stopped``
+    #    handles daemon restarts; this path covers the case where the
+    #    container was explicitly stopped or the daemon was kicked.
+    container = camo.get("docker_container", "camofox-browser")
+    docker_bin = camo.get("docker_binary", "/opt/homebrew/bin/docker")
+    if container:
+        try:
+            proc = subprocess.run(
+                [docker_bin, "start", container],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            attempts.append(f"{docker_bin} start {container} raised {exc}")
+        else:
+            if proc.returncode != 0:
+                attempts.append(
+                    f"docker start {container} rc={proc.returncode} stderr={_truncate(proc.stderr)}"
+                )
+
+    # 3. Poll until /health returns, or timeout.
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if camofox_ready(health_url):
+            return RecoveryResult(ok=True, recovered=True)
+        time.sleep(poll_s)
+
+    suffix = "; " + "; ".join(attempts) if attempts else ""
+    reason = f"camofox /health not ready within {timeout_s:.1f}s{suffix}"
+    return RecoveryResult(ok=False, reason=reason)
+
+
+# ---------------------------------------------------------------------------
+# Localhost rewrite
+# ---------------------------------------------------------------------------
+
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def maybe_rewrite_localhost_for_camofox(url: str, config: dict[str, Any]) -> tuple[str, str | None]:
+    """Rewrite ``localhost``/``127.0.0.1`` so Camofox (in a container)
+    can reach services on the macOS host.
+
+    Returns ``(browser_url, target_host)`` where ``target_host`` is the
+    alias that was substituted (``host.docker.internal`` by default) or
+    ``None`` if no rewrite was applied. ``browser_url`` is the URL that
+    should be handed to the underlying browser tool.
+    """
+    camo = _camofox_cfg(config)
+    rewrite = camo.get("localhost_rewrite", {}) or {}
+    if not rewrite or not rewrite.get("enabled"):
+        return url, None
+    target = (rewrite.get("target_host") or "host.docker.internal").strip()
+    if not target:
+        return url, None
+
+    if not url:
+        return url, None
+
+    s = url.strip()
+    low = s.lower()
+    needs_scheme = not any(low.startswith(p) for p in _SCHEME_PREFIXES)
+    parse_input = ("https://" + s) if needs_scheme else s
+    try:
+        parsed = urlparse(parse_input)
+    except ValueError:
+        return url, None
+    host = (parsed.hostname or "").lower()
+    if host not in _LOOPBACK_HOSTS:
+        return url, None
+
+    port = parsed.port
+    new_netloc = target if port is None else f"{target}:{port}"
+    rewritten = parsed._replace(netloc=new_netloc)
+    rebuilt = urlunparse(rewritten)
+    if needs_scheme and rebuilt.startswith("https://"):
+        rebuilt = rebuilt[len("https://") :]
+    return rebuilt, target
+
+
+# ---------------------------------------------------------------------------
 # Decide / apply / ensure
 # ---------------------------------------------------------------------------
 
 
-_LOCAL_HINTS = {"local", "profile", "profile:main"}
+_LOCAL_HINTS = {"local", "profile", "profile:main", "chrome"}
+_CAMOFOX_HINTS = {"camofox", "camofox:main", "docker", "local-docker"}
 _CLOUD_HINTS = {"cloud", "browserbase", "cloud_browser"}
 _FAST_HINTS = {"fast_read", "fast", "read"}
 _AUTO_HINTS = {"auto", "", None}
@@ -303,6 +522,8 @@ def _engine_from_hint(hint: str | None) -> str | None:
     h = hint.strip().lower()
     if h in _LOCAL_HINTS:
         return "profile:main"
+    if h in _CAMOFOX_HINTS:
+        return "camofox:main"
     if h in _CLOUD_HINTS:
         return "cloud"
     if h in _FAST_HINTS:
@@ -332,7 +553,7 @@ def decide_route(  # noqa: PLR0911
     4. global default ``mode == "pinned"`` — **skipped** when the
        session has ``ignore_global=True``, so an explicit auto override
        gives genuine URL-driven behaviour even if a global pin exists
-    5. URL classification
+    5. URL classification (engine read from each class's config)
     6. ``default_interactive_engine``
     """
     cfg = config if config is not None else load_config()
@@ -362,32 +583,75 @@ def decide_route(  # noqa: PLR0911
             pinned = global_default.get("pinned_engine") or "cloud"
             return Route(engine=pinned, reason="global default pinned")
 
-    # 5. URL classification
+    # 5. URL classification — iterate classes in priority order and read
+    #    the engine from each class config. ``public_read``'s legacy
+    #    ``strategy: fast_read`` is mapped to engine ``fast_read``.
+    classes_cfg = cfg.get("classes") or {}
     host = url_host(url)
     if host:
-        if matches_class(host, "internal_debug", cfg):
-            return Route(engine="profile:main", reason="internal/debug route")
-        if matches_class(host, "hard_login", cfg):
-            return Route(engine="profile:main", reason="hard-login route")
-        if matches_class(host, "subscription_login", cfg):
-            return Route(engine="cloud", reason="subscription cloud route")
-        if matches_class(host, "public_read", cfg):
-            return Route(engine="fast_read", reason="public read route")
+        for class_name in _CLASS_PRIORITY:
+            cls_cfg = classes_cfg.get(class_name)
+            if not isinstance(cls_cfg, dict):
+                continue
+            if not matches_class(host, class_name, cfg):
+                continue
+            engine = _class_engine(cls_cfg)
+            if not engine:
+                continue
+            return Route(
+                engine=engine,
+                reason=f"{_reason_for_class(class_name)} route",
+            )
 
     # 6. default
     default_engine = (cfg.get("default_interactive_engine") or "cloud").strip()
     return Route(engine=default_engine, reason="default interactive route")
 
 
+# Stable, human-readable reasons that existing tests + status output rely on.
+_CLASS_REASONS: dict[str, str] = {
+    "internal_debug": "internal/debug",
+    "durable_local_login": "durable local login",
+    "hard_login": "hard-login",
+    "human_profile_login": "human profile login",
+    "subscription_login": "subscription cloud",
+    "public_read": "public read",
+}
+
+
+def _reason_for_class(class_name: str) -> str:
+    return _CLASS_REASONS.get(class_name, class_name)
+
+
+def clear_browser_env() -> None:
+    """Strip every engine-specific env var.
+
+    Both Chrome (CDP) and Camofox env vars are process-global. To keep
+    ``apply_engine`` strict — i.e. setting one engine never leaves stale
+    state for another — every entry point that switches engines first
+    calls this helper.
+    """
+    os.environ.pop("BROWSER_CDP_URL", None)
+    os.environ.pop("BROWSER_CLOUD_PROVIDER", None)
+    os.environ.pop("CAMOFOX_URL", None)
+    os.environ.pop("CAMOFOX_USER_ID", None)
+    os.environ.pop("CAMOFOX_SESSION_KEY", None)
+    os.environ.pop("CAMOFOX_ADOPT_EXISTING_TAB", None)
+
+
 def apply_engine(route: Route) -> None:
     """Mutate process env to match ``route``.
 
-    Caller must hold ``state.ROUTER_LOCK``.
+    Caller must hold ``state.ROUTER_LOCK``. ``BROWSER_CDP_URL`` takes
+    priority over Camofox in Hermes (see ``tools/browser_camofox.py``
+    ``is_camofox_mode``), so we clear both env families before setting
+    either one — otherwise a Chrome -> Camofox switch would silently
+    keep using Chrome.
     """
     if route.engine == "profile:main":
+        clear_browser_env()
         if route.cdp_url:
             os.environ["BROWSER_CDP_URL"] = route.cdp_url
-        os.environ.pop("BROWSER_CLOUD_PROVIDER", None)
         logger.info(
             "browser-policy-router set engine=profile:main cdp=%s reason=%s",
             route.cdp_url,
@@ -395,11 +659,30 @@ def apply_engine(route: Route) -> None:
         )
         return
 
-    if route.engine == "cloud":
-        os.environ.pop("BROWSER_CDP_URL", None)
-        os.environ.pop("BROWSER_CLOUD_PROVIDER", None)
+    if route.engine == "camofox:main":
+        clear_browser_env()
+        if route.camofox_url:
+            os.environ["CAMOFOX_URL"] = route.camofox_url
+        if route.camofox_user_id:
+            os.environ["CAMOFOX_USER_ID"] = route.camofox_user_id
+        if route.camofox_session_key:
+            os.environ["CAMOFOX_SESSION_KEY"] = route.camofox_session_key
+        if route.camofox_adopt_existing_tab is not None:
+            os.environ["CAMOFOX_ADOPT_EXISTING_TAB"] = (
+                "true" if route.camofox_adopt_existing_tab else "false"
+            )
         logger.info(
-            "browser-policy-router unset BROWSER_CDP_URL reason=%s",
+            "browser-policy-router set engine=camofox:main url=%s user_id=%s reason=%s",
+            route.camofox_url,
+            route.camofox_user_id,
+            route.reason,
+        )
+        return
+
+    if route.engine == "cloud":
+        clear_browser_env()
+        logger.info(
+            "browser-policy-router unset browser env (cloud) reason=%s",
             route.reason,
         )
         return
@@ -411,11 +694,48 @@ def apply_engine(route: Route) -> None:
     )
 
 
-def ensure_route_available(route: Route, config: dict[str, Any]) -> Route:
-    """Run recovery for local profile; fall back to cloud where allowed."""
-    if route.engine != "profile:main":
-        return route
+def _hydrate_camofox_route(route: Route, config: dict[str, Any]) -> None:
+    """Fill camofox_* fields on ``route`` from config defaults."""
+    camo = _camofox_cfg(config)
+    if route.camofox_url is None:
+        url = camo.get("url")
+        if isinstance(url, str) and url.strip():
+            route.camofox_url = url.strip()
+    if route.camofox_user_id is None:
+        uid = camo.get("user_id")
+        if isinstance(uid, str) and uid.strip():
+            route.camofox_user_id = uid.strip()
+    if route.camofox_session_key is None:
+        sk = camo.get("session_key")
+        if isinstance(sk, str) and sk.strip():
+            route.camofox_session_key = sk.strip()
+    if route.camofox_adopt_existing_tab is None:
+        route.camofox_adopt_existing_tab = bool(camo.get("adopt_existing_tab"))
 
+
+def _class_for_reason(reason: str) -> str | None:
+    """Reverse-lookup the class name from a route reason string."""
+    if not reason:
+        return None
+    base = reason.split(";", 1)[0].strip()
+    for cname, label in _CLASS_REASONS.items():
+        if base.startswith(f"{label} "):
+            return cname
+        if base == label:
+            return cname
+    return None
+
+
+def ensure_route_available(route: Route, config: dict[str, Any]) -> Route:
+    """Run recovery for local engines; fall back where allowed."""
+    if route.engine == "profile:main":
+        return _ensure_profile_main(route, config)
+    if route.engine == "camofox:main":
+        return _ensure_camofox_main(route, config)
+    return route
+
+
+def _ensure_profile_main(route: Route, config: dict[str, Any]) -> Route:
     recovery = ensure_local_profile(config)
     local_cfg = (config or {}).get("local_profile", {}) or {}
     if recovery.ok:
@@ -424,7 +744,8 @@ def ensure_route_available(route: Route, config: dict[str, Any]) -> Route:
             route.reason = (route.reason or "") + "; recovered local Chrome"
         return route
 
-    if route.reason.startswith("internal/debug"):
+    cls = _class_for_reason(route.reason)
+    if cls == "internal_debug":
         # Cloud cannot reach localhost / internal targets.
         return route.with_error(recovery.reason)
 
@@ -432,6 +753,61 @@ def ensure_route_available(route: Route, config: dict[str, Any]) -> Route:
         engine="cloud",
         reason=f"profile:main unavailable ({recovery.reason}); fallback cloud",
         fallback_from="profile:main",
+    )
+
+
+def _ensure_camofox_main(route: Route, config: dict[str, Any]) -> Route:
+    recovery = ensure_camofox(config)
+    if recovery.ok:
+        _hydrate_camofox_route(route, config)
+        if recovery.recovered:
+            route.reason = (route.reason or "") + "; recovered camofox"
+        return route
+
+    # Fallback policy depends on the class that produced this route:
+    # - internal_debug: never falls back to cloud (cloud can't see localhost).
+    # - durable_local_login: try profile:main if Chrome is up; otherwise
+    #   only fall back to cloud if the class doesn't ban it.
+    # - any other class: fall back to cloud unless the class bans it.
+    classes_cfg = (config or {}).get("classes") or {}
+    cls = _class_for_reason(route.reason)
+    cls_cfg = classes_cfg.get(cls, {}) if cls else {}
+    no_cloud_fallback = bool(cls_cfg.get("no_cloud_fallback"))
+
+    if cls == "internal_debug":
+        # Try profile:main as a host-side fallback (Chrome can reach the
+        # Mac's loopback even if Camofox is down). If Chrome is up, swap;
+        # otherwise surface the original Camofox error.
+        if cdp_ready((config or {}).get("local_profile", {}).get("cdp_url", "")):
+            return Route(
+                engine="profile:main",
+                cdp_url=(config or {})
+                .get("local_profile", {})
+                .get("cdp_url", "http://127.0.0.1:9222"),
+                reason=f"camofox unavailable ({recovery.reason}); fallback profile:main",
+                fallback_from="camofox:main",
+            )
+        return route.with_error(recovery.reason)
+
+    if cls == "durable_local_login" and cdp_ready(
+        (config or {}).get("local_profile", {}).get("cdp_url", "")
+    ):
+        # Prefer the human Chrome profile if it's up — same identity in
+        # most cases, just GUI-bound.
+        return Route(
+            engine="profile:main",
+            cdp_url=(config or {}).get("local_profile", {}).get("cdp_url", "http://127.0.0.1:9222"),
+            reason=f"camofox unavailable ({recovery.reason}); fallback profile:main",
+            fallback_from="camofox:main",
+        )
+
+    if no_cloud_fallback:
+        return route.with_error(recovery.reason)
+
+    return Route(
+        engine="cloud",
+        reason=f"camofox:main unavailable ({recovery.reason}); fallback cloud",
+        fallback_from="camofox:main",
     )
 
 
@@ -478,6 +854,8 @@ def update_session_after_route(
     session_state["last_reason"] = route.reason
     session_state["last_changed_at"] = datetime.now(timezone.utc).isoformat()
     session_state["cdp_url"] = route.cdp_url
+    session_state["camofox_url"] = route.camofox_url
+    session_state["browser_url"] = route.browser_url
 
 
 def cloud_provider_expected(config: dict[str, Any]) -> str:

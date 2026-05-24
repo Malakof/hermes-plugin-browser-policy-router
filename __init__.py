@@ -131,7 +131,19 @@ def register(ctx) -> None:
     ctx.register_command(
         "browser-local",
         handler=commands.cmd_browser_local,
-        description="Pin to local Chrome profile (global, or for one session)",
+        description="Pin to local Chrome profile (alias of /browser-chrome, kept for compat)",
+        args_hint="[session-name]",
+    )
+    ctx.register_command(
+        "browser-chrome",
+        handler=commands.cmd_browser_chrome,
+        description="Pin to local Chrome profile (profile:main, GUI-bound)",
+        args_hint="[session-name]",
+    )
+    ctx.register_command(
+        "browser-camofox",
+        handler=commands.cmd_browser_camofox,
+        description="Pin to local Camofox (camofox:main, Docker/noVNC, durable)",
         args_hint="[session-name]",
     )
     ctx.register_command(
@@ -143,7 +155,7 @@ def register(ctx) -> None:
     ctx.register_command(
         "browser-recover",
         handler=commands.cmd_browser_recover,
-        description="Recover local Chrome profile via launchctl",
+        description="Recover local Chrome (launchctl) and Camofox (Colima/docker start)",
     )
     ctx.register_command(
         "browser-route",

@@ -75,6 +75,12 @@ def _browser_policy_status_impl(args: dict[str, Any], **kwargs) -> str:
         agent_state = routing.launchctl_state(local_cfg.get("launchctl_label", ""))
         cdp_env = os.environ.get("BROWSER_CDP_URL", "")
 
+        camo_cfg = config.get("camofox", {}) or {}
+        camo_health = routing._camofox_health_url(camo_cfg)
+        camo_ok = routing.camofox_ready(camo_health) if camo_health else False
+        colima_state = routing.launchctl_state(camo_cfg.get("colima_launchctl_label", ""))
+        camofox_env = os.environ.get("CAMOFOX_URL", "")
+
     payload = {
         "session_key": session_key,
         "mode": mode,
@@ -92,8 +98,20 @@ def _browser_policy_status_impl(args: dict[str, Any], **kwargs) -> str:
             "launchctl_label": local_cfg.get("launchctl_label", ""),
             "launchctl_state": agent_state,
         },
+        "camofox": {
+            "url": camo_cfg.get("url", ""),
+            "health_url": camo_health,
+            "ready": camo_ok,
+            "no_vnc_url": camo_cfg.get("no_vnc_url", ""),
+            "colima_launchctl_label": camo_cfg.get("colima_launchctl_label", ""),
+            "colima_state": colima_state,
+            "docker_container": camo_cfg.get("docker_container", ""),
+            "user_id": camo_cfg.get("user_id", ""),
+            "session_key": camo_cfg.get("session_key", ""),
+        },
         "cloud_provider_expected": routing.cloud_provider_expected(config),
         "browser_cdp_url_env": cdp_env,
+        "camofox_url_env": camofox_env,
     }
     return _ok(payload)
 
@@ -101,6 +119,9 @@ def _browser_policy_status_impl(args: dict[str, Any], **kwargs) -> str:
 # ---------------------------------------------------------------------------
 # browser_policy_set
 # ---------------------------------------------------------------------------
+
+
+_VALID_SET_ENGINES = {"profile:main", "camofox:main", "cloud", "auto"}
 
 
 def browser_policy_set(args: dict[str, Any], **kwargs) -> str:
@@ -111,12 +132,12 @@ def browser_policy_set(args: dict[str, Any], **kwargs) -> str:
         return _error("browser_policy_set", exc)
 
 
-def _browser_policy_set_impl(args: dict[str, Any], **kwargs) -> str:
+def _browser_policy_set_impl(args: dict[str, Any], **kwargs) -> str:  # noqa: PLR0911
     engine = (args.get("engine") or "").strip().lower()
-    if engine not in {"profile:main", "cloud", "auto"}:
+    if engine not in _VALID_SET_ENGINES:
         return _error(
             "browser_policy_set",
-            ValueError(f"unsupported engine {engine!r}; want profile:main/cloud/auto"),
+            ValueError(f"unsupported engine {engine!r}; want profile:main/camofox:main/cloud/auto"),
         )
 
     config = routing.load_config(reload=True)
@@ -178,6 +199,39 @@ def _browser_policy_set_impl(args: dict[str, Any], **kwargs) -> str:
                     "cdp_url": route.cdp_url,
                     "recovered": recovery.recovered,
                     "message": "Browser policy: pinned to local Chrome profile",
+                }
+            )
+
+        if engine == "camofox:main":
+            recovery = routing.ensure_camofox(config)
+            if not recovery.ok:
+                return _error(
+                    "browser_policy_set",
+                    RuntimeError(f"Camofox unavailable: {recovery.reason}"),
+                )
+            route = routing.Route(
+                engine="camofox:main",
+                reason="pinned by browser_policy_set",
+            )
+            routing._hydrate_camofox_route(route, config)
+            routing.maybe_cleanup_on_switch(session, route)
+            routing.apply_engine(route)
+            routing.update_session_after_route(session, route, None)
+            session["mode"] = "pinned"
+            session["pinned_engine"] = "camofox:main"
+            session["explicit_engine"] = None
+            session["ignore_global"] = False
+            state.save_state()
+            camo_cfg = config.get("camofox", {}) or {}
+            return _ok(
+                {
+                    "session_key": session_key,
+                    "mode": "pinned",
+                    "pinned_engine": "camofox:main",
+                    "camofox_url": route.camofox_url,
+                    "no_vnc_url": camo_cfg.get("no_vnc_url", ""),
+                    "recovered": recovery.recovered,
+                    "message": "Browser policy: pinned to local Camofox (Docker/noVNC)",
                 }
             )
 

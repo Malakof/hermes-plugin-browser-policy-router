@@ -86,6 +86,22 @@ def local_chrome_available(plugin, monkeypatch):
 
 
 @pytest.fixture
+def camofox_available(plugin, monkeypatch):
+    """Make ``ensure_camofox`` succeed without a real Camofox/Docker.
+
+    CI runners don't have Colima or the Camofox container, so we stub
+    the /health probe + the recovery path the same way we do for Chrome.
+    """
+    monkeypatch.setattr(plugin.routing, "camofox_ready", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        plugin.routing,
+        "ensure_camofox",
+        lambda cfg: plugin.routing.RecoveryResult(ok=True, recovered=False),
+    )
+    monkeypatch.setattr(plugin.routing, "cleanup_browsers", lambda: None)
+
+
+@pytest.fixture
 def base_config():
     """Realistic config dict — mirrors config.yaml.example domain classes."""
     return {
@@ -99,6 +115,25 @@ def base_config():
             "recovery_enabled": True,
             "recovery_timeout_s": 1,
             "recovery_poll_interval_s": 0.05,
+        },
+        "camofox": {
+            "name": "main",
+            "url": "http://127.0.0.1:9377",
+            "health_url": "http://127.0.0.1:9377/health",
+            "no_vnc_url": "http://127.0.0.1:6080",
+            "user_id": "hermes-main",
+            "session_key": "main",
+            "adopt_existing_tab": True,
+            "recovery_enabled": True,
+            "colima_launchctl_label": "system/com.hermes.colima-richard",
+            "docker_container": "camofox-browser",
+            "docker_binary": "/opt/homebrew/bin/docker",
+            "recovery_timeout_s": 1,
+            "recovery_poll_interval_s": 0.05,
+            "localhost_rewrite": {
+                "enabled": True,
+                "target_host": "host.docker.internal",
+            },
         },
         "classes": {
             "internal_debug": {
@@ -127,3 +162,38 @@ def base_config():
         },
         "fast_read_chain": ["web_extract", "web_search", "cloud_browser"],
     }
+
+
+@pytest.fixture
+def camofox_config(base_config):
+    """Config dict where internal_debug + durable_local_login route to camofox:main.
+
+    Mirrors what the production config.yaml.example sets after Phase 3.
+    Existing tests keep using ``base_config`` (Phase 1 routing) so we
+    don't accidentally invalidate them.
+    """
+    cfg = dict(base_config)
+    cfg["classes"] = dict(base_config["classes"])
+    cfg["classes"]["internal_debug"] = {
+        "engine": "camofox:main",
+        "no_cloud_fallback": True,
+        "domains": ["localhost", "*.localhost", "127.0.0.1", "*.local"],
+    }
+    cfg["classes"]["durable_local_login"] = {
+        "engine": "camofox:main",
+        "domains": [
+            "x.com",
+            "*.x.com",
+            "twitter.com",
+            "*.twitter.com",
+            "linkedin.com",
+            "*.linkedin.com",
+        ],
+    }
+    cfg["classes"]["human_profile_login"] = {
+        "engine": "profile:main",
+        "domains": ["accounts.google.com", "mail.google.com"],
+    }
+    # Remove hard_login so durable_local_login takes priority for x.com.
+    cfg["classes"].pop("hard_login", None)
+    return cfg

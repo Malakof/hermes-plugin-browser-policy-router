@@ -9,11 +9,11 @@ specifically — the gateway invokes browser tools with ``task_id=session_id``
 wrapper consults ``SESSION_STATE[session_id]`` and the pin takes effect on
 the next browser tool call from that session.
 
-Note: per-session pins do **not** mutate ``BROWSER_CDP_URL`` eagerly — the
-env is process-global and changing it could interfere with another session
-that happens to be running a browser tool right now. The wrapper will apply
-the engine lazily under ``ROUTER_LOCK`` the next time the target session
-dispatches a browser tool.
+Note: per-session pins do **not** mutate ``BROWSER_CDP_URL`` / ``CAMOFOX_URL``
+eagerly — those envs are process-global and changing them could interfere
+with another session that happens to be running a browser tool right now.
+The wrapper will apply the engine lazily under ``ROUTER_LOCK`` the next time
+the target session dispatches a browser tool.
 """
 
 from __future__ import annotations
@@ -99,7 +99,10 @@ def _resolve_session_id(name_or_id: str) -> tuple[str | None, str]:  # noqa: PLR
 # ---------------------------------------------------------------------------
 
 
-def cmd_browser_status(raw: str) -> str:
+def cmd_browser_status(raw: str) -> str:  # noqa: PLR0915
+    # The status dump intentionally lays out Chrome and Camofox readiness on
+    # separate lines, plus optional session-specific fields, so the linear
+    # statement count is high. Splitting would obscure the rendering order.
     config = routing.load_config(reload=True)
 
     # Optional session-name argument: show that session's pin (if any).
@@ -115,6 +118,12 @@ def cmd_browser_status(raw: str) -> str:
         cdp_ok = routing.cdp_ready(local_cdp)
         agent_state = routing.launchctl_state(local_cfg.get("launchctl_label", ""))
         cdp_env_set = bool(os.environ.get("BROWSER_CDP_URL"))
+
+        camo_cfg = config.get("camofox", {}) or {}
+        camo_health = routing._camofox_health_url(camo_cfg)
+        camo_ok = routing.camofox_ready(camo_health) if camo_health else False
+        colima_state = routing.launchctl_state(camo_cfg.get("colima_launchctl_label", ""))
+        camo_env_set = bool(os.environ.get("CAMOFOX_URL"))
 
         gd = dict(state.GLOBAL_DEFAULT)
         global_mode = gd.get("mode", "auto")
@@ -139,10 +148,19 @@ def cmd_browser_status(raw: str) -> str:
         f"global set by: {global_set_by}",
         f"global changed at: {global_changed_at}",
         f"local CDP: {'OK' if cdp_ok else 'DOWN'} {local_cdp}",
-        f"LaunchAgent: {agent_state}",
-        f"cloud expected: {routing.cloud_provider_expected(config)}",
-        f"BROWSER_CDP_URL: {'set' if cdp_env_set else 'unset'}",
+        f"  Chrome LaunchAgent: {agent_state}",
+        f"  BROWSER_CDP_URL: {'set' if cdp_env_set else 'unset'}",
+        f"Camofox: {'OK' if camo_ok else 'DOWN'} {camo_cfg.get('url', '(unconfigured)')}",
     ]
+    no_vnc = camo_cfg.get("no_vnc_url")
+    if no_vnc:
+        lines.append(f"  noVNC: {no_vnc}")
+    if camo_cfg.get("colima_launchctl_label"):
+        lines.append(f"  Colima LaunchDaemon: {colima_state}")
+    if camo_cfg.get("docker_container"):
+        lines.append(f"  Docker container: {camo_cfg.get('docker_container')}")
+    lines.append(f"  CAMOFOX_URL: {'set' if camo_env_set else 'unset'}")
+    lines.append(f"cloud expected: {routing.cloud_provider_expected(config)}")
     if active_pins:
         lines.append("session pins:")
         for sk, pin in active_pins:
@@ -207,11 +225,28 @@ def cmd_browser_auto(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# /browser-local [session-name]
+# /browser-local [session-name] (alias of /browser-chrome — kept for compat)
+# /browser-chrome [session-name]
 # ---------------------------------------------------------------------------
 
 
 def cmd_browser_local(raw: str) -> str:
+    """Pin to local Chrome (profile:main). Alias kept for Phase 1 compat.
+
+    The Phase 3 plan introduces ``/browser-chrome`` as the explicit name
+    and ``/browser-camofox`` for the Docker engine; ``/browser-local`` is
+    intentionally **not** repointed at Camofox to avoid surprising users
+    with muscle memory. New code should prefer ``/browser-chrome``.
+    """
+    return _pin_chrome(raw, source="/browser-local")
+
+
+def cmd_browser_chrome(raw: str) -> str:
+    """Pin to local Chrome (profile:main) — Phase 1 GUI-bound engine."""
+    return _pin_chrome(raw, source="/browser-chrome")
+
+
+def _pin_chrome(raw: str, source: str) -> str:
     config = routing.load_config(reload=True)
     arg = (raw or "").strip()
 
@@ -225,14 +260,14 @@ def cmd_browser_local(raw: str) -> str:
             route = routing.Route(
                 engine="profile:main",
                 cdp_url=local_cfg.get("cdp_url", "http://127.0.0.1:9222"),
-                reason="pinned by /browser-local",
+                reason=f"pinned by {source}",
             )
             routing.cleanup_browsers()
             routing.apply_engine(route)
             state.set_global_default(
                 mode="pinned",
                 pinned_engine="profile:main",
-                set_by="/browser-local",
+                set_by=source,
                 when=_now(),
             )
             state.save_state()
@@ -260,12 +295,74 @@ def cmd_browser_local(raw: str) -> str:
         # Pinning replaces any prior auto-override on this session.
         session["ignore_global"] = False
         session["cdp_url"] = cdp_url
-        session["last_reason"] = f"pinned by /browser-local {arg}"
+        session["last_reason"] = f"pinned by {source} {arg}"
         session["last_changed_at"] = _now()
         state.save_state()
 
     suffix = " (recovered local Chrome)" if recovery.recovered else ""
     return f"Browser policy for session {session_id!r}: pinned to local Chrome profile{suffix}"
+
+
+# ---------------------------------------------------------------------------
+# /browser-camofox [session-name]
+# ---------------------------------------------------------------------------
+
+
+def cmd_browser_camofox(raw: str) -> str:
+    """Pin to durable local Camofox (camofox:main) — Phase 3 Docker engine."""
+    config = routing.load_config(reload=True)
+    arg = (raw or "").strip()
+
+    camo_cfg = config.get("camofox", {}) or {}
+    no_vnc = camo_cfg.get("no_vnc_url") or ""
+    vnc_note = f" (noVNC: {no_vnc})" if no_vnc else ""
+
+    if not arg:
+        with state.ROUTER_LOCK:
+            recovery = routing.ensure_camofox(config)
+            if not recovery.ok:
+                return f"Camofox unavailable: {recovery.reason}"
+            route = routing.Route(
+                engine="camofox:main",
+                reason="pinned by /browser-camofox",
+            )
+            routing._hydrate_camofox_route(route, config)
+            routing.cleanup_browsers()
+            routing.apply_engine(route)
+            state.set_global_default(
+                mode="pinned",
+                pinned_engine="camofox:main",
+                set_by="/browser-camofox",
+                when=_now(),
+            )
+            state.save_state()
+        suffix = " (recovered)" if recovery.recovered else ""
+        return f"Browser policy (global): pinned to local Camofox (Docker/noVNC){suffix}{vnc_note}"
+
+    session_id, diag = _resolve_session_id(arg)
+    if session_id is None:
+        return f"Could not resolve session {arg!r}: {diag}"
+
+    recovery = routing.ensure_camofox(config)
+    if not recovery.ok:
+        return f"Camofox unavailable: {recovery.reason}"
+
+    with state.ROUTER_LOCK:
+        session = state.get_session(session_id)
+        session["mode"] = "pinned"
+        session["pinned_engine"] = "camofox:main"
+        session["explicit_engine"] = None
+        session["ignore_global"] = False
+        session["camofox_url"] = camo_cfg.get("url")
+        session["last_reason"] = f"pinned by /browser-camofox {arg}"
+        session["last_changed_at"] = _now()
+        state.save_state()
+
+    suffix = " (recovered Camofox)" if recovery.recovered else ""
+    return (
+        f"Browser policy for session {session_id!r}: pinned to local Camofox "
+        f"(Docker/noVNC){suffix}{vnc_note}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +404,7 @@ def cmd_browser_cloud(raw: str) -> str:
         # Pinning replaces any prior auto-override on this session.
         session["ignore_global"] = False
         session["cdp_url"] = None
+        session["camofox_url"] = None
         session["last_reason"] = f"pinned by /browser-cloud {arg}"
         session["last_changed_at"] = _now()
         state.save_state()
@@ -318,19 +416,34 @@ def cmd_browser_cloud(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# /browser-recover
+# /browser-recover — Chrome + Camofox
 # ---------------------------------------------------------------------------
 
 
 def cmd_browser_recover(raw: str) -> str:
     config = routing.load_config(reload=True)
     with state.ROUTER_LOCK:
-        recovery = routing.ensure_local_profile(config)
-    if recovery.ok:
-        if recovery.recovered:
-            return "Local Chrome CDP: recovered (launchctl kickstart succeeded)"
-        return "Local Chrome CDP: already up"
-    return f"Local Chrome CDP: DOWN ({recovery.reason})"
+        chrome = routing.ensure_local_profile(config)
+        camofox = routing.ensure_camofox(config)
+
+    lines: list[str] = []
+    if chrome.ok:
+        if chrome.recovered:
+            lines.append("Local Chrome CDP: recovered (launchctl kickstart succeeded)")
+        else:
+            lines.append("Local Chrome CDP: already up")
+    else:
+        lines.append(f"Local Chrome CDP: DOWN ({chrome.reason})")
+
+    if camofox.ok:
+        if camofox.recovered:
+            lines.append("Camofox: recovered (Colima/docker start succeeded)")
+        else:
+            lines.append("Camofox: already up")
+    else:
+        lines.append(f"Camofox: DOWN ({camofox.reason})")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +451,7 @@ def cmd_browser_recover(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def cmd_browser_route(raw: str) -> str:
+def cmd_browser_route(raw: str) -> str:  # noqa: PLR0912
     """Show the route that would be picked for a URL.
 
     Two forms:
@@ -407,6 +520,10 @@ def cmd_browser_route(raw: str) -> str:
     ]
     if route.cdp_url:
         parts.append(f"cdp_url: {route.cdp_url}")
+    if route.camofox_url:
+        parts.append(f"camofox_url: {route.camofox_url}")
+    if route.browser_url and route.browser_url != url:
+        parts.append(f"browser_url: {route.browser_url}")
     if route.fallback_from:
         parts.append(f"fallback_from: {route.fallback_from}")
     if route.error:

@@ -9,13 +9,20 @@ default_mode: auto
 
 # Engine used when an URL doesn't match any class and routing falls
 # back to the interactive default. Set to "cloud" (Browserbase) for
-# normal use; "profile:main" is also valid.
+# normal use; "profile:main" or "camofox:main" are also valid.
 default_interactive_engine: cloud
 
 # Free-form label of the cloud provider you expect Hermes to use.
 # Shown in /browser-status output; not consulted at runtime.
 cloud_provider_expected: browserbase
 
+# ---------------------------------------------------------------------------
+# profile:main — local Chrome over CDP, GUI-bound (Phase 1).
+#
+# Required when classes route to engine: profile:main. The LaunchAgent runs
+# Chrome under the macOS GUI session, so this engine is only available while
+# someone is logged in to the host.
+# ---------------------------------------------------------------------------
 local_profile:
   name: main
   cdp_url: http://127.0.0.1:9222
@@ -26,22 +33,60 @@ local_profile:
   recovery_timeout_s: 8
   recovery_poll_interval_s: 0.5
 
+# ---------------------------------------------------------------------------
+# camofox:main — local Camofox (Camoufox/Firefox) in Docker via Colima/noVNC,
+# durable across reboots and GUI logout (Phase 3).
+#
+# Required when classes route to engine: camofox:main. The container is
+# bound to loopback only; expose noVNC via SSH tunnel to log in manually.
+# ---------------------------------------------------------------------------
+camofox:
+  name: main
+  url: http://127.0.0.1:9377
+  health_url: http://127.0.0.1:9377/health
+  no_vnc_url: http://127.0.0.1:6080
+  # Stable identity for managed persistence — must match
+  # ``browser.camofox.user_id`` in ~/.hermes/config.yaml.
+  user_id: hermes-main
+  session_key: main
+  adopt_existing_tab: true
+  recovery_enabled: true
+  # System LaunchDaemon that owns the Colima VM (required for the Docker
+  # daemon to be up). Kickstarted before the container is started.
+  colima_launchctl_label: system/com.hermes.colima-richard
+  docker_container: camofox-browser
+  docker_binary: /opt/homebrew/bin/docker
+  recovery_timeout_s: 20
+  recovery_poll_interval_s: 1
+  # Rewrite ``localhost`` / ``127.0.0.1`` so the container can reach
+  # services on the macOS host (Camofox cannot dial the Mac's loopback
+  # from inside the VM). Disable if you only browse external sites.
+  localhost_rewrite:
+    enabled: true
+    target_host: host.docker.internal
+
 # Routing classes. Each entry is matched against the URL host using
-# exact and glob (``*.example.com``) patterns. First match wins, in
-# the order: internal_debug, hard_login, subscription_login, public_read.
+# exact and glob (``*.example.com``) patterns. Class priority matches
+# the order below: internal_debug, durable_local_login, hard_login,
+# human_profile_login, subscription_login, public_read. First match wins.
 classes:
+  # Local dev apps and *.local mDNS targets. Camofox can reach the host
+  # via ``localhost_rewrite.target_host`` (host.docker.internal under
+  # Colima). Cloud cannot see these — never falls back.
   internal_debug:
-    engine: profile:main
+    engine: camofox:main
+    no_cloud_fallback: true
     domains:
       - localhost
       - "*.localhost"
       - "127.0.0.1"
       - "*.local"
 
-  # Sites where the local Chrome profile holds an authenticated
-  # session that the cloud browser cannot reproduce.
-  hard_login:
-    engine: profile:main
+  # Sites where you want a durable local login that survives GUI logout
+  # and reboots. Uses the Camofox profile in
+  # ``/Users/richard/.hermes/camofox``; log in once via noVNC.
+  durable_local_login:
+    engine: camofox:main
     domains:
       - x.com
       - "*.x.com"
@@ -49,6 +94,12 @@ classes:
       - "*.twitter.com"
       - linkedin.com
       - "*.linkedin.com"
+
+  # Sites that must use Chrome + 1Password (GUI-bound). Available only
+  # while someone is logged in to the macOS host.
+  human_profile_login:
+    engine: profile:main
+    domains:
       - accounts.google.com
       - mail.google.com
 
