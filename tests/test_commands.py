@@ -273,3 +273,96 @@ class TestPersistence:
         plugin.state.load_state()
         assert plugin.state.GLOBAL_DEFAULT["mode"] == "auto"
         assert plugin.state.SESSION_STATE == {}
+
+
+# ---------------------------------------------------------------------------
+# /browser-help
+# ---------------------------------------------------------------------------
+
+
+class TestBrowserHelp:
+    """``/browser-help`` is the operator-facing docs surface on
+    Telegram/Discord. These tests pin the contract that the overview
+    references every engine and every other slash command, and that the
+    per-topic drill-down works for both engine names and command names.
+    """
+
+    def test_overview_lists_all_engines(self, plugin):
+        out = plugin.commands.cmd_browser_help("")
+        for engine in ("profile:main", "camofox:main", "cloud", "fast_read"):
+            assert engine in out, f"overview missing engine {engine!r}"
+
+    def test_overview_lists_all_slash_commands(self, plugin):
+        out = plugin.commands.cmd_browser_help("")
+        for cmd in (
+            "/browser-status",
+            "/browser-auto",
+            "/browser-chrome",
+            "/browser-camofox",
+            "/browser-cloud",
+            "/browser-recover",
+            "/browser-route",
+            "/browser-sessions",
+            "/browser-help",
+        ):
+            assert cmd in out, f"overview missing command {cmd!r}"
+
+    def test_overview_lists_model_tools(self, plugin):
+        out = plugin.commands.cmd_browser_help("")
+        for tool in (
+            "browser_policy_status",
+            "browser_policy_set",
+            "browser_policy_route",
+        ):
+            assert tool in out
+
+    def test_overview_points_at_current_paths(self, plugin):
+        out = plugin.commands.cmd_browser_help("")
+        # Persistence path moved to ~/.hermes/state/ — the help text must
+        # not regress to the legacy "next to plugin" claim.
+        assert "~/.hermes/state/browser-policy-router/state.json" in out
+        assert ".state.json next to" not in out
+        assert "README.md" in out
+        assert "config.yaml" in out
+
+    def test_topic_engine_returns_focused_section(self, plugin):
+        out = plugin.commands.cmd_browser_help("profile:main")
+        assert out.startswith("engine profile:main")
+        # Other engine bodies must not bleed in.
+        assert "Camoufox in Docker" not in out
+        assert "fast_read" not in out
+
+    def test_topic_command_with_slash_prefix(self, plugin):
+        # Operators paste ``/browser-help /browser-recover`` from chat —
+        # both the slash and ``browser-`` prefix must be stripped.
+        out = plugin.commands.cmd_browser_help("/browser-recover")
+        assert out.startswith("/browser-recover")
+        assert "kickstart" in out.lower()
+
+    def test_topic_command_with_browser_prefix(self, plugin):
+        out = plugin.commands.cmd_browser_help("browser-recover")
+        assert out.startswith("/browser-recover")
+
+    def test_topic_command_bare_name(self, plugin):
+        out = plugin.commands.cmd_browser_help("status")
+        assert out.startswith("/browser-status")
+
+    def test_topic_local_is_aliased_to_its_own_section(self, plugin):
+        # ``/browser-local`` is a kept-for-compat alias of ``/browser-chrome``
+        # but gets its own help section so users searching for the alias
+        # don't hit "unknown topic".
+        out = plugin.commands.cmd_browser_help("local")
+        assert "/browser-local" in out
+        assert "alias" in out.lower()
+
+    def test_unknown_topic_lists_available_ones(self, plugin):
+        out = plugin.commands.cmd_browser_help("foobar")
+        assert "No help topic" in out
+        assert "engines:" in out
+        assert "commands:" in out
+        assert "profile:main" in out
+        assert "recover" in out
+
+    def test_topic_is_case_insensitive_and_whitespace_tolerant(self, plugin):
+        out = plugin.commands.cmd_browser_help("  STATUS  ")
+        assert out.startswith("/browser-status")

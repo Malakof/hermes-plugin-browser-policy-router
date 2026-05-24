@@ -195,6 +195,38 @@ _CLASS_PRIORITY: tuple[str, ...] = (
 VALID_ENGINES: frozenset[str] = frozenset({"profile:main", "camofox:main", "cloud", "fast_read"})
 
 
+def _validated_engine(candidate: Any, context: str) -> str:
+    """Return ``candidate`` when it's a known engine, else fall back to ``"cloud"``.
+
+    Used at every ``decide_route`` entry point that consumes an engine
+    string from external state (persisted session pins, the global
+    default pin, the ``default_interactive_engine`` config key, and the
+    explicit one-shot engine). A misconfigured or stale value used to
+    sneak through and result in ``Route(engine=<unknown>)`` which then
+    silently flowed past ``apply_engine`` (env cleared, no override,
+    Hermes' built-in routing took over) -- the user saw a navigation
+    happen via the cloud provider while the reason was reported as the
+    typo'd engine.
+
+    Logging at WARNING (not ERROR) because the function recovers; a
+    failed nav is more disruptive than an unsupported pin. Class
+    engines keep their own validator (``_class_engine``) because they
+    additionally need to honour the legacy ``strategy: fast_read``
+    fallback before deciding.
+    """
+    if isinstance(candidate, str):
+        normalized = candidate.strip()
+        if normalized in VALID_ENGINES:
+            return normalized
+    logger.warning(
+        "browser-policy-router: %s engine %r not in %s; falling back to 'cloud'",
+        context,
+        candidate,
+        sorted(VALID_ENGINES),
+    )
+    return "cloud"
+
+
 def _class_engine(cls_cfg: dict[str, Any]) -> str | None:
     """Return the engine for a class config, honouring ``strategy: fast_read``.
 
@@ -646,11 +678,16 @@ def decide_route(  # noqa: PLR0911
     if explicit:
         if consume_explicit:
             session_state["explicit_engine"] = None
-        return Route(engine=explicit, reason="session explicit hint")
+        return Route(
+            engine=_validated_engine(explicit, "session explicit_engine"),
+            reason="session explicit hint",
+        )
 
     # 3. session pin
     if session_state.get("mode") == "pinned":
-        pinned = session_state.get("pinned_engine") or "cloud"
+        pinned = _validated_engine(
+            session_state.get("pinned_engine"), "session pinned_engine"
+        )
         return Route(engine=pinned, reason="session pinned")
 
     # 4. global default pin (slash-command driven), unless the session
@@ -658,7 +695,9 @@ def decide_route(  # noqa: PLR0911
     if not session_state.get("ignore_global"):
         global_default = router_state.GLOBAL_DEFAULT
         if global_default.get("mode") == "pinned":
-            pinned = global_default.get("pinned_engine") or "cloud"
+            pinned = _validated_engine(
+                global_default.get("pinned_engine"), "global pinned_engine"
+            )
             return Route(engine=pinned, reason="global default pinned")
 
     # 5. URL classification — iterate classes in priority order and read
@@ -682,7 +721,10 @@ def decide_route(  # noqa: PLR0911
             )
 
     # 6. default
-    default_engine = (cfg.get("default_interactive_engine") or "cloud").strip()
+    default_engine = _validated_engine(
+        cfg.get("default_interactive_engine"),
+        "default_interactive_engine config",
+    )
     return Route(engine=default_engine, reason="default interactive route")
 
 

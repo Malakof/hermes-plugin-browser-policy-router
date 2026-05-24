@@ -160,3 +160,107 @@ class TestHint:
         )
         assert route.engine == "profile:main"
         assert route.reason == "session explicit hint"
+
+
+# ---------------------------------------------------------------------------
+# Engine validation — _validated_engine helper + decide_route integration
+# ---------------------------------------------------------------------------
+
+
+class TestValidatedEngine:
+    """Unit tests for the centralized engine validator.
+
+    Guards against the regression where a typo'd engine name in a
+    persisted pin or in the ``default_interactive_engine`` config slid
+    through ``decide_route`` unchanged, only to be silently wiped by
+    ``apply_engine``'s defensive ``clear_browser_env`` -- the user saw
+    a navigation that ran on the previous engine while the reason
+    reported the typo'd value.
+    """
+
+    def test_accepts_each_valid_engine(self, plugin):
+        for engine in ("profile:main", "camofox:main", "cloud", "fast_read"):
+            assert plugin.routing._validated_engine(engine, "test") == engine
+
+    def test_strips_surrounding_whitespace(self, plugin):
+        assert plugin.routing._validated_engine("  cloud  ", "test") == "cloud"
+
+    def test_none_falls_back_to_cloud(self, plugin, caplog):
+        with caplog.at_level("WARNING", logger="browser_policy_router.routing"):
+            assert plugin.routing._validated_engine(None, "ctx-none") == "cloud"
+        assert "ctx-none" in caplog.text
+
+    def test_empty_string_falls_back_to_cloud(self, plugin, caplog):
+        with caplog.at_level("WARNING", logger="browser_policy_router.routing"):
+            assert plugin.routing._validated_engine("", "ctx-empty") == "cloud"
+        assert "ctx-empty" in caplog.text
+
+    def test_whitespace_only_falls_back_to_cloud(self, plugin):
+        assert plugin.routing._validated_engine("   ", "test") == "cloud"
+
+    def test_typo_falls_back_to_cloud_with_warning(self, plugin, caplog):
+        with caplog.at_level("WARNING", logger="browser_policy_router.routing"):
+            assert plugin.routing._validated_engine("typo-engine", "ctx-typo") == "cloud"
+        # The warning must mention both the bad value and the context so
+        # operators can locate the misconfig in their gateway.log.
+        assert "typo-engine" in caplog.text
+        assert "ctx-typo" in caplog.text
+
+    def test_non_string_falls_back_to_cloud(self, plugin):
+        assert plugin.routing._validated_engine(42, "test") == "cloud"
+        assert plugin.routing._validated_engine({"engine": "cloud"}, "test") == "cloud"
+        assert plugin.routing._validated_engine([], "test") == "cloud"
+
+
+class TestEngineValidationInDecideRoute:
+    """``decide_route`` must coerce invalid engine values everywhere it
+    consumes them from external state, not just in class configs."""
+
+    def test_default_interactive_engine_typo_falls_back(self, plugin, base_config):
+        # Reproduces the original repro from the code review: a typo in
+        # ``default_interactive_engine`` used to flow through to
+        # ``apply_engine`` unchanged and leave the wrapper with no
+        # override -- routing reason looked right, behaviour didn't.
+        base_config["default_interactive_engine"] = "typo-engine"
+        session = plugin.state._empty_session()
+        route = plugin.routing.decide_route(
+            "https://example.org", session, "auto", base_config
+        )
+        assert route.engine == "cloud"
+        assert route.reason == "default interactive route"
+
+    def test_session_pinned_typo_falls_back(self, plugin, base_config):
+        # Simulates a state.json that survived a plugin downgrade with a
+        # stale engine name. Persisted pins must be revalidated on read.
+        session = plugin.state._empty_session()
+        session["mode"] = "pinned"
+        session["pinned_engine"] = "no-such-engine"
+        route = plugin.routing.decide_route(
+            "https://x.com/home", session, "auto", base_config
+        )
+        assert route.engine == "cloud"
+        assert route.reason == "session pinned"
+
+    def test_global_pinned_typo_falls_back(self, plugin, base_config):
+        # Same defence for the global default pin -- editing the state
+        # file by hand or rolling back the plugin must not break the
+        # router.
+        plugin.state.set_global_default("pinned", "garbage", "/test", _ts())
+        session = plugin.state._empty_session()
+        route = plugin.routing.decide_route(
+            "https://example.org", session, "auto", base_config
+        )
+        assert route.engine == "cloud"
+        assert route.reason == "global default pinned"
+
+    def test_explicit_engine_typo_falls_back(self, plugin, base_config):
+        session = plugin.state._empty_session()
+        session["explicit_engine"] = "lightpanda"  # not (yet) a valid engine
+        route = plugin.routing.decide_route(
+            "https://example.org", session, "auto", base_config, consume_explicit=True
+        )
+        assert route.engine == "cloud"
+        assert route.reason == "session explicit hint"
+        # Explicit must still be consumed even when invalid -- otherwise
+        # the same bogus value would fire again on the next call.
+        assert session["explicit_engine"] is None

@@ -1,6 +1,6 @@
 manifest_version: 1
 name: browser-policy-router
-version: 1.1.0-beta.2
+version: 1.1.0-beta.3
 kind: standalone
 description: Route Hermes browser work between local Chrome profile, local Camofox (Docker/noVNC), configured cloud browser, and fast read tools.
 author: Malakof

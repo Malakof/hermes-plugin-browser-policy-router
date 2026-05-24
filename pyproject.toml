@@ -1,6 +1,6 @@
 [project]
 name = "hermes-plugin-browser-policy-router"
-version = "1.1.0-beta.2"
+version = "1.1.0-beta.3"
 description = "Hermes plugin: route browser work between local Chrome profile, local Camofox (Docker/noVNC), configured cloud browser, and fast read tools."
 readme = "README.md"
 requires-python = ">=3.11"

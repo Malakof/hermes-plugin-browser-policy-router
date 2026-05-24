@@ -14,8 +14,11 @@ wrappers:
    ``/browser-auto``).
 3. **Auto routing** — URL classification when neither layer pins.
 
-State is persisted to ``.state.json`` next to the plugin so per-session
-pins and the global default survive a gateway restart. Persistence is
+State is persisted to ``~/.hermes/state/browser-policy-router/state.json``
+so per-session pins and the global default survive a gateway restart
+**and** ``hermes plugins install --force`` (which rebuilds the plugin
+checkout). A legacy ``.state.json`` next to the plugin from v1.0 installs
+is auto-migrated on first read (see ``_state_path``). Persistence is
 best-effort: a failed write is logged but does not abort the operation.
 """
 

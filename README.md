@@ -53,6 +53,41 @@ All mutations and all wrapped browser calls serialize through a single
 `ROUTER_LOCK`. This is acceptable for a personal gateway where browser usage
 is mostly serial; it is not a robust multi-tenant browser isolation model.
 
+### Engine availability matrix
+
+What each engine actually does on this host depends on whether a GUI
+session is present and whether the Colima VM is up. Earlier versions of
+this doc claimed `profile:main` was unavailable after logout — with the
+`chrome-headless-guard.sh` daemon (system LaunchDaemon, see Phase 3
+notes in the host setup doc), that's no longer true: a headless Chrome
+takes over the same `--user-data-dir` and CDP port when the GUI
+LaunchAgent is down. Cookies persist, but UI-bound bits (1Password
+popups, CAPTCHA solving via VNC, screencapture) don't.
+
+| Engine | Logged in (GUI up) | Logged out (no GUI) | Notes |
+|---|---|---|---|
+| `profile:main` | Chrome **headed** + 1Password autofill + full Aqua UI | Chrome **headless** on the same `~/.hermes/chrome-profiles/main` data-dir → cookies survive, but **no 1Password popups, no CAPTCHA UI, no screencapture** | The two Chromes never run at once; `chrome-headless-guard.sh` arbitrates via `gui_chrome_up()` |
+| `camofox:main` | Available | Available — durable across reboot + logout via Colima system daemon | Logins are done through noVNC (`127.0.0.1:6080`, SSH-tunnel exposed) and persist in `~/.hermes/camofox`. Independent of macOS GUI state |
+| `cloud` | Available | Available | Pure network — no host resources used |
+| `fast_read` | Available | Available | In-process; falls through to `cloud` when the chain exhausts |
+
+Practical mapping for the typical use cases:
+
+- **Twitter / LinkedIn / sites that need a real human-curated session**:
+  `camofox:main` (durable, headless host friendly). Falls back to
+  `profile:main` headed when you happen to be logged in if you prefer
+  the 1Password autofill ergonomics.
+- **Google / Gmail / sites that strictly want 1Password autofill**:
+  `profile:main` while logged in. If you're logged out the headless
+  fallback can still navigate with existing cookies, but a re-login
+  flow will block on the missing 1Password UI — pin `camofox:main` or
+  fall back to `cloud` for the duration of the re-auth.
+- **Internal / `.local` / `*.crystalia.fr`**: `camofox:main` (it can
+  reach the host via `host.docker.internal` while still routing private
+  IPs away from the cloud provider).
+- **Public read-only docs**: `fast_read` (cheap, no browser spin-up).
+- **Everything else**: `cloud` (the configured `default_interactive_engine`).
+
 ## Routing model
 
 For each `browser_navigate(url)`, the first matching rule wins:
@@ -429,10 +464,16 @@ If `host.docker.internal` does not resolve under your Colima version, try
 
 ## Persistence
 
-`SESSION_STATE` and `GLOBAL_DEFAULT` are persisted to `.state.json` next
-to the plugin on every mutation (atomic tmp-then-rename) and reloaded at
-plugin register-time. Per-session pins and the global default survive a
-gateway restart. The file is gitignored.
+`SESSION_STATE` and `GLOBAL_DEFAULT` are persisted to
+`~/.hermes/state/browser-policy-router/state.json` on every mutation
+(atomic tmp-then-rename) and reloaded at plugin register-time. The state
+directory lives outside the plugin checkout so `hermes plugins install
+--force` no longer clobbers pinned engines.
+
+A legacy `.state.json` next to the plugin from v1.0 installs is
+auto-migrated on first read (the legacy file is then removed to avoid
+two conflicting copies). Per-session pins and the global default survive
+a gateway restart.
 
 Camofox's own browser profile lives in `~/.hermes/camofox` (host) /
 `/root/.camofox` (container) and is persisted by the Camofox server itself;
@@ -480,9 +521,10 @@ Recommendations:
 - The fast-read chain hits third-party APIs (e.g. Firecrawl). If you
   configure a provider with an API key, that key sees the URLs you
   query. Use providers you trust for the workload.
-- `.state.json` may contain session ids and last-visited URLs. It is
-  gitignored, but treat the plugin directory like the rest of
-  `~/.hermes/` (it holds tokens, .env, session transcripts).
+- `state.json` (under `~/.hermes/state/browser-policy-router/`) may
+  contain session ids and last-visited URLs. Treat the whole
+  `~/.hermes/` tree as sensitive — it also holds tokens, `.env`, and
+  session transcripts.
 
 ## Troubleshooting
 

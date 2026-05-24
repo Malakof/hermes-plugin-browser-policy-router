@@ -56,7 +56,7 @@ camofox:
   colima_launchctl_label: system/com.hermes.colima-richard
   docker_container: camofox-browser
   docker_binary: /opt/homebrew/bin/docker
-  recovery_timeout_s: 20
+  recovery_timeout_s: 60   # 60s pour absorber le cold-start de Colima/VM
   recovery_poll_interval_s: 1
   # Rewrite ``localhost`` / ``127.0.0.1`` so the container can reach
   # services on the macOS host (Camofox cannot dial the Mac's loopback

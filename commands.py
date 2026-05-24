@@ -630,6 +630,172 @@ def cmd_browser_sessions(raw: str) -> str:
     return "\n".join(header + rows)
 
 
+# ---------------------------------------------------------------------------
+# /browser-help [topic]
+# ---------------------------------------------------------------------------
+#
+# Cheat-sheet handler. Without an argument, prints a one-page overview of
+# every engine, slash command, and model-facing tool. With an argument,
+# returns a focused section: an engine name (``profile:main``,
+# ``camofox:main``, ``cloud``, ``fast_read``) or a command name (with or
+# without the leading slash, e.g. ``recover`` or ``/browser-recover``).
+#
+# This exists because the plugin's surface grew past what fits in a single
+# Telegram/Discord message — operators were hitting ``/browser-status``
+# expecting docs and getting a state dump instead.
+
+
+def cmd_browser_help(raw: str) -> str:
+    arg = (raw or "").strip().lower()
+    # Allow ``/browser-help status``, ``/browser-help /browser-status``,
+    # and bare ``/browser-help browser-status`` — normalise to ``status``.
+    if arg.startswith("/browser-"):
+        arg = arg[len("/browser-"):]
+    elif arg.startswith("browser-"):
+        arg = arg[len("browser-"):]
+
+    if arg in _HELP_SECTIONS:
+        return _HELP_SECTIONS[arg]
+    if arg:
+        return (
+            f"No help topic {arg!r}. Known topics:\n"
+            f"  engines:  profile:main, camofox:main, cloud, fast_read\n"
+            f"  commands: status, auto, chrome, camofox, cloud, recover, route, sessions, help\n"
+            f"Run /browser-help alone for the full overview."
+        )
+    return _HELP_OVERVIEW
+
+
+# Per-topic sections (keys are normalised — no leading slash, no
+# "browser-" prefix). Engine keys keep their colon syntax so the user can
+# paste an engine string from a status dump verbatim.
+_HELP_SECTIONS: dict[str, str] = {
+    "profile:main": (
+        "engine profile:main — local Chrome via CDP\n"
+        "  Env: BROWSER_CDP_URL=http://127.0.0.1:9222\n"
+        "  Backends: headed Chrome (GUI LaunchAgent) when logged in;\n"
+        "            headless Chrome (system LaunchDaemon guard) when logged out.\n"
+        "  Both share ~/.hermes/chrome-profiles/main so cookies persist across\n"
+        "  the switch. 1Password popups + CAPTCHA UI work only in headed mode.\n"
+        "  Slash: /browser-chrome  (alias /browser-local for muscle-memory)"
+    ),
+    "camofox:main": (
+        "engine camofox:main — Camoufox in Docker via Colima\n"
+        "  Env: CAMOFOX_URL + CAMOFOX_USER_ID + CAMOFOX_SESSION_KEY +\n"
+        "       CAMOFOX_ADOPT_EXISTING_TAB\n"
+        "  Durable across reboot and macOS logout (Colima is a system daemon).\n"
+        "  Manual login via noVNC on 127.0.0.1:6080 (SSH-tunnel from outside).\n"
+        "  Profile lives in ~/.hermes/camofox; independent from the Chrome profile.\n"
+        "  Slash: /browser-camofox"
+    ),
+    "cloud": (
+        "engine cloud — configured cloud provider (expected: browserbase)\n"
+        "  Env: BROWSER_CDP_URL + CAMOFOX_URL cleared.\n"
+        "  Hermes' built-in resolution picks the cloud provider from your\n"
+        "  config. No local resources used. Default fallback when no class\n"
+        "  matches and no pin is active.\n"
+        "  Slash: /browser-cloud"
+    ),
+    "fast_read": (
+        "engine fast_read — non-browser extraction chain\n"
+        "  No browser spin-up. Runs each tool in fast_read_chain (default:\n"
+        "  web_extract → web_search → cloud_browser) until one returns usable\n"
+        "  content. Result is tagged requires_browser_for_interaction so the\n"
+        "  model knows not to call browser_click on it.\n"
+        "  Routed automatically for ``public_read`` class hosts."
+    ),
+    "status": (
+        "/browser-status [session-name]\n"
+        "  Dump router state: global pin, Chrome/Camofox readiness, active\n"
+        "  session pins, env-var state. With a session-name (id or title),\n"
+        "  also dumps that session's mode + last route."
+    ),
+    "auto": (
+        "/browser-auto [session-name]\n"
+        "  Clear the global pin, fall back to URL-classification routing.\n"
+        "  With a session-name, marks that session as ignoring the global\n"
+        "  pin (ignore_global=true) so it always auto-routes."
+    ),
+    "chrome": (
+        "/browser-chrome [session-name]\n"
+        "  Pin to engine profile:main (Chrome over CDP). Global pin is\n"
+        "  eager — mutates BROWSER_CDP_URL immediately. Per-session pin is\n"
+        "  lazy — applied on the next browser call from that session.\n"
+        "  Alias: /browser-local (kept for muscle-memory)."
+    ),
+    "local": (
+        "/browser-local — alias of /browser-chrome.\n"
+        "  Kept for backwards compatibility; new code should use /browser-chrome."
+    ),
+    "camofox": (
+        "/browser-camofox [session-name]\n"
+        "  Pin to engine camofox:main (Docker Camoufox via Colima).\n"
+        "  Same eager-vs-lazy rules as /browser-chrome."
+    ),
+    "cloud-cmd": (
+        "/browser-cloud [session-name]\n"
+        "  Pin to the configured cloud provider."
+    ),
+    "recover": (
+        "/browser-recover\n"
+        "  Best-effort recovery: kickstart the Chrome GUI LaunchAgent and\n"
+        "  start the Colima daemon + Camofox container if they're down.\n"
+        "  Safe to run at any time; idempotent."
+    ),
+    "route": (
+        "/browser-route [<session-name>] <url>\n"
+        "  Compute (without executing) which engine the router would pick\n"
+        "  for the URL, given current state. Useful to debug class matches\n"
+        "  and pin precedence."
+    ),
+    "sessions": (
+        "/browser-sessions\n"
+        "  List recent sessions with their browser policy state\n"
+        "  (mode, pinned engine, last URL, ignore_global flag)."
+    ),
+    "help": (
+        "/browser-help [topic]\n"
+        "  Without a topic: full overview of engines, commands, and tools.\n"
+        "  With a topic: focused section for an engine name or command name."
+    ),
+}
+
+
+_HELP_OVERVIEW = (
+    "browser-policy-router — route Hermes browser tools across engines\n"
+    "\n"
+    "Engines (run /browser-help <engine> for details):\n"
+    "  profile:main   local Chrome via CDP (headed when logged in, headless via guard otherwise)\n"
+    "  camofox:main   Camoufox in Docker via Colima — durable across reboot + logout\n"
+    "  cloud          configured cloud provider (expected: browserbase)\n"
+    "  fast_read      non-browser extraction chain (web_extract → web_search → cloud_browser)\n"
+    "\n"
+    "Slash commands (run /browser-help <name> for details):\n"
+    "  /browser-status [session]     router state + Chrome/Camofox readiness\n"
+    "  /browser-auto [session]       clear pin, URL-classification routing\n"
+    "  /browser-chrome [session]     pin to profile:main (alias: /browser-local)\n"
+    "  /browser-camofox [session]    pin to camofox:main\n"
+    "  /browser-cloud [session]      pin to cloud\n"
+    "  /browser-recover              kickstart Chrome LaunchAgent + Colima/Camofox\n"
+    "  /browser-route [session] url  preview which engine would handle a URL\n"
+    "  /browser-sessions             list recent sessions and their pins\n"
+    "  /browser-help [topic]         this help\n"
+    "\n"
+    "Model-facing tools (called by the agent, not by you):\n"
+    "  browser_policy_status({session_id?})\n"
+    "  browser_policy_set({engine, session_id?})\n"
+    "  browser_policy_route({url, hint?, session_id?})\n"
+    "\n"
+    "Routing precedence: hint arg → session explicit → session pin → global pin →\n"
+    "URL class match → default_interactive_engine.\n"
+    "\n"
+    "Config:    ~/.hermes/plugins/browser-policy-router/config.yaml\n"
+    "State:     ~/.hermes/state/browser-policy-router/state.json\n"
+    "Logs:      ~/.hermes/logs/gateway.log (filter on 'browser-policy-router')\n"
+    "Full docs: ~/.hermes/plugins/browser-policy-router/README.md"
+)
+
+
 def _format_session_row(session_id: str, title: str, state_dict: dict[str, Any]) -> str:
     short = session_id[:12] + "..." if len(session_id) > 12 else session_id
     if not state_dict:

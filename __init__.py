@@ -168,6 +168,12 @@ def register(ctx) -> None:
         handler=commands.cmd_browser_sessions,
         description="List recent sessions with their browser policy state",
     )
+    ctx.register_command(
+        "browser-help",
+        handler=commands.cmd_browser_help,
+        description="Cheat-sheet for engines + slash commands (optionally for one topic)",
+        args_hint="[topic]",
+    )
 
     commands.set_plugin_context(ctx)
     wrappers.set_plugin_context(ctx)
