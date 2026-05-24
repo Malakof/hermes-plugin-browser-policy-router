@@ -121,19 +121,49 @@ Routing to `camofox:main` requires a local Camofox container reachable on
 canonical setup; the short version is:
 
 ```bash
-brew install colima docker
+brew install colima docker docker-buildx
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.hermes.colima-richard.plist
 docker run -d --name camofox-browser --restart unless-stopped \
   -p 127.0.0.1:9377:9377 -p 127.0.0.1:6080:6080 -p 127.0.0.1:5901:5900 \
-  -e CAMOFOX_PORT=9377 -e ENABLE_VNC=1 -e VNC_RESOLUTION=1920x1080 \
-  -e BROWSER_IDLE_TIMEOUT_MS=0 -e CAMOFOX_CRASH_REPORT_ENABLED=false \
+  -e CAMOFOX_PORT=9377 \
+  -e ENABLE_VNC=1 -e VNC_BIND=0.0.0.0 -e VNC_RESOLUTION=1920x1080 \
+  -e VNC_PASSWORD=hermes \
+  -e BROWSER_IDLE_TIMEOUT_MS=86400000 \
+  -e TAB_INACTIVITY_MS=86400000 \
+  -e SESSION_TIMEOUT_MS=86400000 \
+  -e VNC_DEFAULT_URL=about:blank \
+  -e VNC_DEFAULT_USER_ID=hermes-main \
+  -e VNC_DEFAULT_SESSION_KEY=vnc-login \
+  -e CAMOFOX_CRASH_REPORT_ENABLED=false \
   -v /Users/richard/.hermes/camofox:/root/.camofox \
   camofox-browser:135.0.1-aarch64
 curl -s http://127.0.0.1:9377/health
 ```
 
+Gotchas worth knowing before you copy-paste the above:
+
+- **`BROWSER_IDLE_TIMEOUT_MS=0` does not disable the timer.** Upstream
+  `lib/config.js` uses `parseInt(...) || 300000`, so `0` is falsy and
+  silently falls back to 5 minutes — the browser tears itself down and
+  the VNC view goes black. Use a large number (24 h here). Same trap
+  for `TAB_INACTIVITY_MS` and `SESSION_TIMEOUT_MS`.
+- **`VNC_DEFAULT_SESSION_KEY=vnc-login` keeps the human's noVNC tab in
+  a different tab group from Hermes' automated tabs** (both use the
+  same `user_id` so cookies/profile are shared, but the visible tabs
+  don't collide).
+- **macOS Screen Sharing.app hangs on a `None`-auth VNC server**; setting
+  `VNC_PASSWORD` makes the handshake go through. Bind is still
+  `127.0.0.1` only, so the password is loopback-only.
+- Upstream Camofox ships with `vnc.enabled: false` in
+  `camofox.config.json`, which means the VNC plugin doesn't load and
+  noVNC apt deps aren't installed. The image expected by `camofox:main`
+  must be built from a fork that flips it to `true` (see the local
+  Mac mini setup notes in `phase-3-colima-camofox-local-browser.md`
+  for the canonical patch list).
+
 Logins to `camofox:main` are not shared with Chrome. Open
-`http://127.0.0.1:6080` (or tunnel via SSH) and log in once per site.
+`http://127.0.0.1:6080/vnc.html` (or tunnel via SSH) and log in once per
+site.
 
 ## Tools (model-facing)
 

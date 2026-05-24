@@ -187,17 +187,38 @@ _CLASS_PRIORITY: tuple[str, ...] = (
 )
 
 
+# Authoritative set of engines apply_engine() knows how to mutate env for.
+# Any class config that names an engine outside this set is a configuration
+# error -- caught at read time rather than silently treated as "fast_read"
+# (no env mutation), which used to let a typo'd engine name leave the prior
+# engine's BROWSER_CDP_URL / CAMOFOX_URL in place.
+VALID_ENGINES: frozenset[str] = frozenset({"profile:main", "camofox:main", "cloud", "fast_read"})
+
+
 def _class_engine(cls_cfg: dict[str, Any]) -> str | None:
     """Return the engine for a class config, honouring ``strategy: fast_read``.
 
     ``strategy`` is the legacy field name for ``public_read``; we map it
     to engine ``fast_read`` so callers don't have to know about it.
+
+    Returns ``None`` (so ``decide_route`` skips this class) when the
+    config names an engine the plugin doesn't recognise. The misconfig
+    is logged at WARNING so it surfaces in ``gateway.log``.
     """
     if not isinstance(cls_cfg, dict):
         return None
     engine = cls_cfg.get("engine")
     if isinstance(engine, str) and engine.strip():
-        return engine.strip()
+        candidate = engine.strip()
+        if candidate not in VALID_ENGINES:
+            logger.warning(
+                "browser-policy-router: class config has unknown engine %r "
+                "(expected one of %s); class will be skipped",
+                candidate,
+                sorted(VALID_ENGINES),
+            )
+            return None
+        return candidate
     strategy = cls_cfg.get("strategy")
     if isinstance(strategy, str) and strategy.strip().lower() == "fast_read":
         return "fast_read"
@@ -379,9 +400,44 @@ def _camofox_health_url(camo: dict[str, Any]) -> str:
     return ""
 
 
-def ensure_camofox(config: dict[str, Any]) -> RecoveryResult:  # noqa: PLR0911,PLR0912
-    # Recovery mirrors ``ensure_local_profile``: probe, then escalate via
-    # the Colima daemon kickstart + ``docker start`` of the container.
+def _docker_socket_ready(docker_bin: str, deadline: float, poll_s: float) -> bool:
+    """Poll ``docker info`` until it succeeds or ``deadline`` passes.
+
+    Cold-Colima takes ~5-15 s after ``launchctl kickstart`` returns
+    before the Docker socket actually answers. The previous one-shot
+    ``docker start`` got "Cannot connect to the Docker daemon" once
+    and the recovery never retried -- it just polled ``/health``
+    uselessly until timeout. Probing ``docker info`` first turns this
+    into a clean wait.
+    """
+    while time.time() < deadline:
+        try:
+            proc = subprocess.run(
+                [docker_bin, "info", "--format", "{{.ServerVersion}}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            time.sleep(poll_s)
+            continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            return True
+        time.sleep(poll_s)
+    return False
+
+
+def ensure_camofox(config: dict[str, Any]) -> RecoveryResult:  # noqa: PLR0911,PLR0912,PLR0915
+    # Phased recovery so cold-Colima starts work in addition to warm
+    # docker restart:
+    #   1. probe /health -- if up, done.
+    #   2. launchctl kickstart the Colima LaunchDaemon (idempotent).
+    #   3. poll `docker info` until the Docker socket answers.
+    #   4. retry `docker start <container>` until success or deadline
+    #      (idempotent: a no-op success on an already-running container).
+    #   5. poll /health until ready or deadline.
+    #
     # Each branch keeps a distinct ``reason`` so /browser-status can show
     # why the engine is unavailable.
     camo = _camofox_cfg(config)
@@ -395,13 +451,20 @@ def ensure_camofox(config: dict[str, Any]) -> RecoveryResult:  # noqa: PLR0911,P
     if not camo.get("recovery_enabled", True):
         return RecoveryResult(ok=False, reason="camofox down; recovery disabled")
 
-    timeout_s = float(camo.get("recovery_timeout_s", 20))
+    # Default 60 s -- cold-Colima starts (launchctl kickstart -> VM boot
+    # -> Docker daemon -> container -> Camoufox handshake) can easily
+    # take 30-45 s. The previous default of 20 s was tuned for warm
+    # docker restart only.
+    timeout_s = float(camo.get("recovery_timeout_s", 60))
     poll_s = float(camo.get("recovery_poll_interval_s", 1.0))
+    deadline = time.time() + timeout_s
 
     attempts: list[str] = []
+    container = camo.get("docker_container", "camofox-browser")
+    docker_bin = camo.get("docker_binary", "/opt/homebrew/bin/docker")
 
-    # 1. Make sure the Colima daemon is up — if it isn't, ``docker start``
-    #    below cannot reach the Docker socket.
+    # 1. Kickstart the Colima daemon. If it isn't up, the Docker
+    #    socket won't answer below.
     label = camo.get("colima_launchctl_label", "")
     if label:
         try:
@@ -421,12 +484,21 @@ def ensure_camofox(config: dict[str, Any]) -> RecoveryResult:  # noqa: PLR0911,P
                     f"stderr={_truncate(proc.stderr)}"
                 )
 
-    # 2. ``docker start`` the container. ``--restart unless-stopped``
-    #    handles daemon restarts; this path covers the case where the
-    #    container was explicitly stopped or the daemon was kicked.
-    container = camo.get("docker_container", "camofox-browser")
-    docker_bin = camo.get("docker_binary", "/opt/homebrew/bin/docker")
-    if container:
+    # 2. Wait for the Docker socket to answer. Colima takes seconds to
+    #    boot the VM after `launchctl` returns.
+    if not _docker_socket_ready(docker_bin, deadline, poll_s):
+        attempts.append("docker socket never answered (Colima cold start?)")
+        return RecoveryResult(
+            ok=False,
+            reason=f"camofox unavailable: {'; '.join(attempts)}",
+        )
+
+    # 3. Retry `docker start` until the container reports running, or
+    #    the deadline. Idempotent: starting an already-running
+    #    container is a no-op success.
+    started = False
+    last_start_err = ""
+    while time.time() < deadline:
         try:
             proc = subprocess.run(
                 [docker_bin, "start", container],
@@ -436,15 +508,21 @@ def ensure_camofox(config: dict[str, Any]) -> RecoveryResult:  # noqa: PLR0911,P
                 check=False,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-            attempts.append(f"{docker_bin} start {container} raised {exc}")
-        else:
-            if proc.returncode != 0:
-                attempts.append(
-                    f"docker start {container} rc={proc.returncode} stderr={_truncate(proc.stderr)}"
-                )
+            last_start_err = f"{docker_bin} start {container} raised {exc}"
+            time.sleep(poll_s)
+            continue
+        if proc.returncode == 0:
+            started = True
+            break
+        last_start_err = (
+            f"docker start {container} rc={proc.returncode} stderr={_truncate(proc.stderr)}"
+        )
+        time.sleep(poll_s)
+    if not started:
+        attempts.append(last_start_err or "docker start never succeeded")
+        return RecoveryResult(ok=False, reason=f"camofox unavailable: {'; '.join(attempts)}")
 
-    # 3. Poll until /health returns, or timeout.
-    deadline = time.time() + timeout_s
+    # 4. Poll /health until the Node server inside the container answers.
     while time.time() < deadline:
         if camofox_ready(health_url):
             return RecoveryResult(ok=True, recovered=True)
@@ -647,7 +725,24 @@ def apply_engine(route: Route) -> None:
     ``is_camofox_mode``), so we clear both env families before setting
     either one — otherwise a Chrome -> Camofox switch would silently
     keep using Chrome.
+
+    Unknown engines are now hard-failed: a typo in ``engine:`` in a
+    class config used to fall through every branch below and leave the
+    previously-applied env untouched, so the request would silently run
+    in the *previous* engine. We clear the env first and log loudly
+    instead so misconfigs are obvious.
     """
+    if route.engine not in VALID_ENGINES:
+        clear_browser_env()
+        logger.error(
+            "browser-policy-router: refusing to apply unknown engine %r "
+            "(expected one of %s); env has been cleared. reason=%s",
+            route.engine,
+            sorted(VALID_ENGINES),
+            route.reason,
+        )
+        return
+
     if route.engine == "profile:main":
         clear_browser_env()
         if route.cdp_url:

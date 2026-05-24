@@ -61,6 +61,41 @@ class TestRoutingPicksCamofoxFromConfig:
 # ---------------------------------------------------------------------------
 
 
+class TestInvalidEngineGuards:
+    """The adversarial reviewer noted: a typo in ``engine:`` used to leave
+    the previously-applied env in place (silent regression). The guards
+    in `_class_engine` and `apply_engine` now refuse unknown names.
+    """
+
+    def test_class_with_unknown_engine_is_skipped_by_decide_route(self, plugin, base_config):
+        cfg = dict(base_config)
+        cfg["classes"] = dict(base_config["classes"])
+        cfg["classes"]["hard_login"] = {
+            "engine": "typo-engine",
+            "domains": ["x.com"],
+        }
+        session = plugin.state._empty_session()
+        route = plugin.routing.decide_route("https://x.com/home", session, "auto", cfg)
+        # Unknown engine -> class skipped -> falls through to default.
+        assert route.engine == "cloud"
+        assert route.reason == "default interactive route"
+
+    def test_apply_engine_unknown_clears_env_loudly(self, plugin, monkeypatch):
+        # Pre-set both env families so we can assert apply_engine strips them.
+        monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
+        monkeypatch.setenv("CAMOFOX_URL", "http://127.0.0.1:9377")
+        route = plugin.routing.Route(engine="typo-engine", reason="test")
+        plugin.routing.apply_engine(route)
+        assert "BROWSER_CDP_URL" not in os.environ
+        assert "CAMOFOX_URL" not in os.environ
+
+    def test_valid_engines_set_is_what_we_expect(self, plugin):
+        assert (
+            frozenset({"profile:main", "camofox:main", "cloud", "fast_read"})
+            == plugin.routing.VALID_ENGINES
+        )
+
+
 class TestApplyEngineStrict:
     def test_apply_camofox_clears_cdp(self, plugin, monkeypatch):
         monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
@@ -112,8 +147,9 @@ class TestEnsureCamofox:
         assert not result.recovered
 
     def test_kicks_colima_and_docker_then_polls(self, plugin, base_config, monkeypatch):
-        # First /health probe says DOWN; after kickstart/docker start the
-        # next probe says UP — exercising the recovery code path.
+        # First /health probe says DOWN; after kickstart/docker info/
+        # docker start the next probe says UP -- exercising the
+        # phased recovery code path added in v1.1.0-beta.2.
         calls = {"count": 0}
 
         def fake_ready(url, timeout=1.5):
@@ -125,12 +161,18 @@ class TestEnsureCamofox:
         run_log: list[list[str]] = []
 
         class FakeProc:
-            returncode = 0
-            stdout = ""
-            stderr = ""
+            def __init__(self, stdout="", returncode=0, stderr=""):
+                self.stdout = stdout
+                self.returncode = returncode
+                self.stderr = stderr
 
         def fake_run(args, **_kw):
             run_log.append(args)
+            # `docker info --format ...` must report a non-empty
+            # ServerVersion to declare the socket ready. Other calls
+            # (launchctl, docker start) return empty stdout, success.
+            if len(args) >= 2 and "info" in args:
+                return FakeProc(stdout="20.10.0\n")
             return FakeProc()
 
         monkeypatch.setattr(plugin.routing.subprocess, "run", fake_run)
@@ -138,19 +180,59 @@ class TestEnsureCamofox:
         result = plugin.routing.ensure_camofox(base_config)
         assert result.ok
         assert result.recovered
-        # We should see both a launchctl kickstart and a docker start.
+        # We should see launchctl kickstart, docker info, and docker start.
         assert any("kickstart" in " ".join(args) for args in run_log)
+        assert any("info" in args for args in run_log)
         assert any("start" in args and "camofox-browser" in args for args in run_log)
 
-    def test_timeout_surfaces_reason(self, plugin, base_config, monkeypatch):
+    def test_recovery_fails_when_docker_socket_never_comes_up(
+        self, plugin, base_config, monkeypatch
+    ):
+        # New behaviour: if `docker info` never succeeds, the recovery
+        # bails out before trying to `docker start` (which would just
+        # fail with "Cannot connect to the Docker daemon" anyway).
         monkeypatch.setattr(plugin.routing, "camofox_ready", lambda *_a, **_k: False)
 
         class FakeProc:
-            returncode = 0
+            returncode = 1
             stdout = ""
-            stderr = ""
+            stderr = "Cannot connect to the Docker daemon"
 
-        monkeypatch.setattr(plugin.routing.subprocess, "run", lambda *_a, **_k: FakeProc())
+        run_log: list[list[str]] = []
+
+        def fake_run(args, **_kw):
+            run_log.append(args)
+            return FakeProc()
+
+        monkeypatch.setattr(plugin.routing.subprocess, "run", fake_run)
+        result = plugin.routing.ensure_camofox(base_config)
+        assert not result.ok
+        assert "docker socket never answered" in result.reason
+        # docker start should NOT have been attempted -- the socket
+        # readiness probe gate stopped us.
+        assert not any("start" in args and "camofox-browser" in args for args in run_log)
+
+    def test_timeout_surfaces_reason(self, plugin, base_config, monkeypatch):
+        # /health stays DOWN forever, but kickstart + docker info +
+        # docker start all succeed -- so we exercise the /health
+        # polling timeout (not the docker-socket-never-up branch).
+        monkeypatch.setattr(plugin.routing, "camofox_ready", lambda *_a, **_k: False)
+
+        class FakeProc:
+            def __init__(self, stdout="", returncode=0, stderr=""):
+                self.stdout = stdout
+                self.returncode = returncode
+                self.stderr = stderr
+
+        def fake_run(args, **_kw):
+            # `docker info --format ...` must report a non-empty server
+            # version for `_docker_socket_ready` to clear; everything
+            # else (launchctl, docker start) returns success/empty.
+            if len(args) >= 2 and "info" in args:
+                return FakeProc(stdout="20.10.0\n")
+            return FakeProc()
+
+        monkeypatch.setattr(plugin.routing.subprocess, "run", fake_run)
         result = plugin.routing.ensure_camofox(base_config)
         assert not result.ok
         assert "not ready" in result.reason

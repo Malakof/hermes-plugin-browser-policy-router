@@ -115,13 +115,49 @@ def reset_global_default() -> None:
 # ---------------------------------------------------------------------------
 
 
-_STATE_FILENAME = ".state.json"
+_STATE_FILENAME = "state.json"
+# Default lives under ~/.hermes/state/browser-policy-router/ rather than
+# inside the plugin checkout itself. Two reasons:
+#   - `hermes plugins install --force` reinstalls the plugin directory
+#     and could clobber the file, taking pinned-engine state with it.
+#   - the file holds runtime state, not plugin source, so it doesn't
+#     belong in a code path. Tests still override via set_persistence_path.
+_LEGACY_STATE_FILENAME = ".state.json"
 _PERSIST_PATH: Path | None = None
 
 
+def _state_dir() -> Path:
+    """Return ``~/.hermes/state/browser-policy-router/`` (created on demand)."""
+    base = Path.home() / ".hermes" / "state" / "browser-policy-router"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
 def _state_path() -> Path:
-    """Default persistence path — next to the plugin module."""
-    return Path(__file__).parent / _STATE_FILENAME
+    """Default persistence path — under ``~/.hermes/state/...``.
+
+    If a legacy ``.state.json`` is still sitting next to the plugin
+    module (Phase 1 / v1.0 path), migrate it on first call and remove
+    the legacy file so we don't end up reading two conflicting copies.
+    """
+    new_path = _state_dir() / _STATE_FILENAME
+    legacy = Path(__file__).parent / _LEGACY_STATE_FILENAME
+    if legacy.exists() and not new_path.exists():
+        try:
+            new_path.write_bytes(legacy.read_bytes())
+            legacy.unlink()
+            logger.info(
+                "browser-policy-router: migrated legacy state %s -> %s",
+                legacy,
+                new_path,
+            )
+        except OSError as exc:  # pragma: no cover - filesystem issue
+            logger.warning(
+                "browser-policy-router: failed to migrate legacy state %s: %s",
+                legacy,
+                exc,
+            )
+    return new_path
 
 
 def set_persistence_path(path: Path | None) -> None:
